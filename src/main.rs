@@ -296,7 +296,7 @@ fn parse_csp_override(
 fn init_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "dev_proxy=info,hudsucker=info".into()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "rexy=info,hudsucker=info".into()),
         )
         .init();
 }
