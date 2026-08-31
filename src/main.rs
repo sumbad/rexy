@@ -145,7 +145,12 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let ca = ca::load_ca()?;
 
-    let handler = DevRedirect::new(proxy_host.clone(), proxy_path.clone(), local_target.clone());
+    let handler = DevRedirect::new(
+        proxy_host.clone(),
+        proxy_path.clone(),
+        local_target.clone(),
+        None,
+    );
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 

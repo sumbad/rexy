@@ -41,14 +41,25 @@ pub struct DevRedirect {
     prod_host: String,
     path_prefix: String,
     local_target: String,
+    csp_override: Option<CspOverride>,
+    /// One entry per handled request on this connection: `true` if the request
+    /// was rewritten to the local target. Popped by `handle_response`.
+    redirected_queue: VecDeque<bool>,
 }
 
 impl DevRedirect {
-    pub fn new(prod_host: String, path_prefix: String, local_target: String) -> Self {
+    pub fn new(
+        prod_host: String,
+        path_prefix: String,
+        local_target: String,
+        csp_override: Option<CspOverride>,
+    ) -> Self {
         Self {
             prod_host: prod_host.trim_end_matches('.').to_ascii_lowercase(),
             path_prefix: normalize_path_prefix(&path_prefix),
             local_target: local_target.trim_end_matches('/').to_string(),
+            csp_override,
+            redirected_queue: VecDeque::new(),
         }
     }
 
@@ -103,27 +114,45 @@ impl HttpHandler for DevRedirect {
     async fn handle_request(
         &mut self,
         _ctx: &HttpContext,
-        mut req: Request<Body>,
+        req: Request<Body>,
     ) -> RequestOrResponse {
+        RequestOrResponse::Request(self.handle_request_inner(req))
+    }
+
+    async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
+        self.handle_response_inner(res)
+    }
+}
+
+impl DevRedirect {
+    fn handle_request_inner(&mut self, mut req: Request<Body>) -> Request<Body> {
+        let redirected = self.rewrite_request(&mut req);
+
+        self.redirected_queue.push_back(redirected);
+
+        req
+    }
+
+    fn rewrite_request(&mut self, req: &mut Request<Body>) -> bool {
         tracing::info!(
             method = %req.method(),
             host = ?req.headers().get(header::HOST),
             uri = %req.uri(),
-            matches = self.matches_request(&req),
+            matches = self.matches_request(req),
             "HTTP request"
         );
 
-        if !self.matches_request(&req) {
-            return RequestOrResponse::Request(req);
+        if !self.matches_request(req) {
+            return false;
         }
 
-        let Some(new_uri) = self.target_uri(&req) else {
+        let Some(new_uri) = self.target_uri(req) else {
             tracing::error!(
                 uri = ?req.uri(),
                 "failed to construct local target URI"
             );
 
-            return RequestOrResponse::Request(req);
+            return false;
         };
 
         let path_and_query = req
@@ -143,7 +172,7 @@ impl HttpHandler for DevRedirect {
                     "failed to extract local target host"
                 );
 
-                return RequestOrResponse::Request(req);
+                return false;
             }
         };
 
@@ -158,7 +187,21 @@ impl HttpHandler for DevRedirect {
             "redirecting request to local dev server"
         );
 
-        RequestOrResponse::Request(req)
+        true
+    }
+
+    fn handle_response_inner(&mut self, mut res: Response<Body>) -> Response<Body> {
+        let redirected = self.redirected_queue.pop_front().unwrap_or(false);
+
+        if redirected {
+            if let Some(csp_override) = &self.csp_override {
+                apply_csp_override(res.headers_mut(), csp_override);
+
+                tracing::info!(?csp_override, "csp override applied to redirected response");
+            }
+        }
+
+        res
     }
 }
 
@@ -212,7 +255,10 @@ mod tests {
             &CspOverride::Policy("frame-ancestors *".into()),
         );
 
-        assert_eq!(headers[header::CONTENT_SECURITY_POLICY], "frame-ancestors *");
+        assert_eq!(
+            headers[header::CONTENT_SECURITY_POLICY],
+            "frame-ancestors *"
+        );
     }
 
     #[test]
@@ -254,6 +300,84 @@ mod tests {
         assert_eq!(
             headers[header::CONTENT_SECURITY_POLICY_REPORT_ONLY],
             "default-src 'none'"
+        );
+    }
+
+    fn handler(csp_override: Option<CspOverride>) -> DevRedirect {
+        DevRedirect::new(
+            "example.com".into(),
+            "/".into(),
+            "http://127.0.0.1:5173".into(),
+            csp_override,
+        )
+    }
+
+    fn request_to(host: &str, path: &str) -> Request<Body> {
+        Request::builder()
+            .uri(format!("https://{host}{path}"))
+            .header(header::HOST, host)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn response_with_csp(policy: &str) -> Response<Body> {
+        let mut res = Response::new(Body::empty());
+        res.headers_mut()
+            .insert(header::CONTENT_SECURITY_POLICY, policy.parse().unwrap());
+        res
+    }
+
+    #[test]
+    fn response_for_redirected_request_gets_override() {
+        let mut h = handler(Some(CspOverride::Off));
+
+        let req = request_to("example.com", "/app.js");
+        let _ = h.handle_request_inner(req);
+
+        let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+
+        assert!(!res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+    }
+
+    #[test]
+    fn response_for_passthrough_request_is_untouched() {
+        let mut h = handler(Some(CspOverride::Off));
+
+        let req = request_to("other.com", "/app.js");
+        let _ = h.handle_request_inner(req);
+
+        let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+
+        assert_eq!(
+            res.headers()[header::CONTENT_SECURITY_POLICY],
+            "frame-ancestors 'self'"
+        );
+    }
+
+    #[test]
+    fn response_without_override_keeps_csp() {
+        let mut h = handler(None);
+
+        let req = request_to("example.com", "/app.js");
+        let _ = h.handle_request_inner(req);
+
+        let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+
+        assert_eq!(
+            res.headers()[header::CONTENT_SECURITY_POLICY],
+            "frame-ancestors 'self'"
+        );
+    }
+
+    #[test]
+    fn response_without_prior_request_is_untouched() {
+        let mut h = handler(Some(CspOverride::Off));
+
+        let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+
+        assert_eq!(
+            res.headers()[header::CONTENT_SECURITY_POLICY],
+            "frame-ancestors 'self'"
         );
     }
 }
