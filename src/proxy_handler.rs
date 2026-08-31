@@ -1,5 +1,3 @@
-use std::collections::VecDeque;
-
 use hudsucker::{
     Body, HttpContext, HttpHandler, RequestOrResponse,
     hyper::{HeaderMap, Request, Response, Uri, header},
@@ -42,9 +40,15 @@ pub struct DevRedirect {
     path_prefix: String,
     local_target: String,
     csp_override: Option<CspOverride>,
-    /// One entry per handled request on this connection: `true` if the request
-    /// was rewritten to the local target. Popped by `handle_response`.
-    redirected_queue: VecDeque<bool>,
+    /// Outcome of the most recent request handled by this instance, consumed
+    /// by `handle_response` of the same request.
+    ///
+    /// hudsucker clones the handler per request, so this must NOT be an
+    /// accumulating structure: a `VecDeque` would leak entries from the
+    /// CONNECT phase into every clone (clones are made from the instance that
+    /// already processed CONNECT). Overwriting the field in
+    /// `handle_request` makes inherited values irrelevant.
+    redirected: Option<bool>,
 }
 
 impl DevRedirect {
@@ -59,7 +63,7 @@ impl DevRedirect {
             path_prefix: normalize_path_prefix(&path_prefix),
             local_target: local_target.trim_end_matches('/').to_string(),
             csp_override,
-            redirected_queue: VecDeque::new(),
+            redirected: None,
         }
     }
 
@@ -128,7 +132,7 @@ impl DevRedirect {
     fn handle_request_inner(&mut self, mut req: Request<Body>) -> Request<Body> {
         let redirected = self.rewrite_request(&mut req);
 
-        self.redirected_queue.push_back(redirected);
+        self.redirected = Some(redirected);
 
         req
     }
@@ -191,7 +195,7 @@ impl DevRedirect {
     }
 
     fn handle_response_inner(&mut self, mut res: Response<Body>) -> Response<Body> {
-        let redirected = self.redirected_queue.pop_front().unwrap_or(false);
+        let redirected = self.redirected.take().unwrap_or(false);
 
         if redirected && let Some(csp_override) = &self.csp_override {
             apply_csp_override(res.headers_mut(), csp_override);
@@ -377,5 +381,22 @@ mod tests {
             res.headers()[header::CONTENT_SECURITY_POLICY],
             "frame-ancestors 'self'"
         );
+    }
+
+    #[test]
+    fn non_redirected_state_does_not_leak_into_cloned_handler() {
+        // Real hudsucker flow: one handler instance processes the CONNECT
+        // request (no redirect), then `serve_stream` clones that instance for
+        // every decrypted inner request. The clone must not inherit the
+        // non-redirected outcome: its own request decides.
+        let mut connect_handler = handler(Some(CspOverride::Off));
+        let _ = connect_handler.handle_request_inner(request_to("other.com", "/"));
+
+        let mut inner = connect_handler.clone();
+        let _ = inner.handle_request_inner(request_to("example.com", "/"));
+
+        let res = inner.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+
+        assert!(!res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
     }
 }
