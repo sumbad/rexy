@@ -1,7 +1,40 @@
+use std::collections::VecDeque;
+
 use hudsucker::{
     Body, HttpContext, HttpHandler, RequestOrResponse,
-    hyper::{Request, Uri, header},
+    hyper::{HeaderMap, Request, Response, Uri, header},
 };
+
+/// How to rewrite the `Content-Security-Policy` header of responses served
+/// from the local target. Parsed from `rexy run --csp-override`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CspOverride {
+    /// Remove all Content-Security-Policy headers.
+    Off,
+    /// Replace all Content-Security-Policy headers with this policy string.
+    Policy(String),
+}
+
+/// Replace or remove every `Content-Security-Policy` header.
+///
+/// `HeaderMap::insert` replaces all values previously stored under the key, so
+/// a single insert collapses multiple CSP headers into one.
+/// `Content-Security-Policy-Report-Only` is a different header name and is
+/// never touched.
+fn apply_csp_override(headers: &mut HeaderMap, csp: &CspOverride) {
+    match csp {
+        CspOverride::Off => {
+            headers.remove(header::CONTENT_SECURITY_POLICY);
+        }
+        CspOverride::Policy(policy) => {
+            if let Ok(value) = header::HeaderValue::from_str(policy) {
+                headers.insert(header::CONTENT_SECURITY_POLICY, value);
+            }
+            // Policy was validated at CLI parse time, so from_str cannot fail
+            // here; if it somehow does, leave the headers untouched.
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct DevRedirect {
@@ -157,4 +190,70 @@ fn local_target_host(target: &str) -> Option<String> {
     let authority = uri.authority()?;
 
     Some(authority.as_str().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers_with_csp(values: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(header::CONTENT_SECURITY_POLICY, value.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn policy_replaces_existing_csp() {
+        let mut headers = headers_with_csp(&["frame-ancestors 'self'"]);
+        apply_csp_override(
+            &mut headers,
+            &CspOverride::Policy("frame-ancestors *".into()),
+        );
+
+        assert_eq!(headers[header::CONTENT_SECURITY_POLICY], "frame-ancestors *");
+    }
+
+    #[test]
+    fn off_removes_all_csp_headers() {
+        let mut headers = headers_with_csp(&["default-src 'self'", "frame-ancestors 'none'"]);
+        apply_csp_override(&mut headers, &CspOverride::Off);
+
+        assert!(!headers.contains_key(header::CONTENT_SECURITY_POLICY));
+    }
+
+    #[test]
+    fn policy_collapses_multiple_csp_headers_into_one() {
+        let mut headers = headers_with_csp(&["default-src 'self'", "frame-ancestors 'self'"]);
+        apply_csp_override(
+            &mut headers,
+            &CspOverride::Policy("frame-ancestors *".into()),
+        );
+
+        assert_eq!(
+            headers
+                .get_all(header::CONTENT_SECURITY_POLICY)
+                .iter()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn report_only_is_untouched() {
+        let mut headers = headers_with_csp(&["frame-ancestors 'self'"]);
+        headers.append(
+            header::CONTENT_SECURITY_POLICY_REPORT_ONLY,
+            "default-src 'none'".parse().unwrap(),
+        );
+
+        apply_csp_override(&mut headers, &CspOverride::Off);
+
+        assert!(!headers.contains_key(header::CONTENT_SECURITY_POLICY));
+        assert_eq!(
+            headers[header::CONTENT_SECURITY_POLICY_REPORT_ONLY],
+            "default-src 'none'"
+        );
+    }
 }
