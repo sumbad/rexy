@@ -193,12 +193,10 @@ impl DevRedirect {
     fn handle_response_inner(&mut self, mut res: Response<Body>) -> Response<Body> {
         let redirected = self.redirected_queue.pop_front().unwrap_or(false);
 
-        if redirected {
-            if let Some(csp_override) = &self.csp_override {
-                apply_csp_override(res.headers_mut(), csp_override);
+        if redirected && let Some(csp_override) = &self.csp_override {
+            apply_csp_override(res.headers_mut(), csp_override);
 
-                tracing::info!(?csp_override, "csp override applied to redirected response");
-            }
+            tracing::info!(?csp_override, "csp override applied to redirected response");
         }
 
         res
