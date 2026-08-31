@@ -5,14 +5,11 @@ mod proxy_handler;
 mod trust;
 
 use clap::{Parser, Subcommand};
-use hudsucker::{
-    rustls::crypto::aws_lc_rs,
-    Proxy,
-};
+use hudsucker::{Proxy, rustls::crypto::aws_lc_rs};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-use browser::{resolve_browser};
+use browser::resolve_browser;
 use proxy_handler::DevRedirect;
 
 #[derive(Debug, Parser)]
@@ -148,11 +145,7 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let ca = ca::load_ca()?;
 
-    let handler = DevRedirect::new(
-        proxy_host.clone(),
-        proxy_path.clone(),
-        local_target.clone(),
-    );
+    let handler = DevRedirect::new(proxy_host.clone(), proxy_path.clone(), local_target.clone());
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -171,10 +164,7 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         "redirect: https://{}{}* -> {}",
         proxy_host, proxy_path, local_target
     );
-    info!(
-        "TLS interception is restricted to host: {}",
-        proxy_host
-    );
+    info!("TLS interception is restricted to host: {}", proxy_host);
 
     let proxy_task = tokio::spawn(async move {
         if let Err(err) = proxy.start().await {
@@ -266,8 +256,7 @@ fn validate_target(target: &str) -> Result<(), Box<dyn std::error::Error>> {
 fn init_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "dev_proxy=info,hudsucker=info".into()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "dev_proxy=info,hudsucker=info".into()),
         )
         .init();
 }

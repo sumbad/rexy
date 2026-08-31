@@ -16,11 +16,9 @@ pub fn resolve_browser(value: &str) -> Result<Browser, Box<dyn std::error::Error
             let path = PathBuf::from(path);
 
             if !path.exists() {
-                return Err(format!(
-                    "browser executable does not exist: {}",
-                    path.display()
-                )
-                .into());
+                return Err(
+                    format!("browser executable does not exist: {}", path.display()).into(),
+                );
             }
 
             path
@@ -79,11 +77,9 @@ fn find_chrome() -> Result<PathBuf, Box<dyn std::error::Error>> {
             std::env::var("PROGRAMFILES")
                 .ok()
                 .map(|v| PathBuf::from(v).join("Google/Chrome/Application/chrome.exe")),
-
             std::env::var("PROGRAMFILES(X86)")
                 .ok()
                 .map(|v| PathBuf::from(v).join("Google/Chrome/Application/chrome.exe")),
-
             std::env::var("LOCALAPPDATA")
                 .ok()
                 .map(|v| PathBuf::from(v).join("Google/Chrome/Application/chrome.exe")),
@@ -116,9 +112,7 @@ fn find_chrome() -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn find_chromium() -> Result<PathBuf, Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     {
-        let candidates = [
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        ];
+        let candidates = ["/Applications/Chromium.app/Contents/MacOS/Chromium"];
 
         for candidate in candidates {
             if Path::new(candidate).exists() {
@@ -129,11 +123,9 @@ fn find_chromium() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
     #[cfg(target_os = "windows")]
     {
-        let candidates = [
-            std::env::var("LOCALAPPDATA")
-                .ok()
-                .map(|v| PathBuf::from(v).join("Chromium/Application/chrome.exe")),
-        ];
+        let candidates = [std::env::var("LOCALAPPDATA")
+            .ok()
+            .map(|v| PathBuf::from(v).join("Chromium/Application/chrome.exe"))];
 
         for candidate in candidates.into_iter().flatten() {
             if candidate.exists() {
@@ -144,10 +136,7 @@ fn find_chromium() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
     #[cfg(target_os = "linux")]
     {
-        for candidate in [
-            "/usr/bin/chromium",
-            "/usr/bin/chromium-browser",
-        ] {
+        for candidate in ["/usr/bin/chromium", "/usr/bin/chromium-browser"] {
             if Path::new(candidate).exists() {
                 return Ok(PathBuf::from(candidate));
             }

@@ -2,6 +2,15 @@
 name = "rexy"
 version = "0.1.0"
 edition = "2024"
+authors = ["sumbad"]
+description = "Launch a browser with a local MITM proxy for transparent dev redirects"
+homepage = "https://github.com/sumbad/rexy"
+repository = "https://github.com/sumbad/rexy"
+license = "MIT"
+readme = "README.md"
+
+[package.metadata.dist]
+npm-package = "rexy"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -16,3 +25,8 @@ tokio = { version = "1", features = [
 ] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
