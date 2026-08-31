@@ -99,6 +99,24 @@ rexy run \
   -- --new-window https://superapp.example.com/mini-app/foo
 ```
 
+If the target server sends a restrictive `Content-Security-Policy` that breaks
+the proxied page (e.g. `frame-ancestors` blocks embedding it in a parent
+shell), override the header for responses served from the target:
+
+```sh
+rexy run \
+  --browser chrome \
+  --host calls-app.example.com \
+  --path / \
+  --target https://dev.example.internal \
+  --csp-override "frame-ancestors *" \
+  -- --new-window https://calls-app.example.com/
+```
+
+`--csp-override off` removes the header entirely. Only responses actually
+redirected to `--target` are affected; production passthrough traffic and
+`Content-Security-Policy-Report-Only` are never modified.
+
 ### Commands
 
 | Command       | Description                                        |
@@ -116,6 +134,7 @@ rexy run \
 | `--path <prefix>`          | `/`        | Production path prefix to redirect (must start with `/`)           |
 | `--target <url>`           | —          | Local development server (`http://` or `https://`)                 |
 | `--proxy-port <port>`      | `0`        | Local proxy port; `0` picks a free port                            |
+| `--csp-override <policy\|off>` | —      | Replace all `Content-Security-Policy` headers of responses served from `--target` (`off` removes them); passthrough traffic is untouched |
 | `-- <args>`                | —          | Extra arguments passed to the browser                              |
 
 ### Logging

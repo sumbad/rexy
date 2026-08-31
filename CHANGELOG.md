@@ -17,3 +17,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`rexy trust` / `rexy clean` commands**: Install/remove the Rexy Local CA in the OS trust store on macOS, Windows, and Linux.
 - **`generate_ca.sh` script**: One-time local CA generation (EC P-256).
 - **Architecture diagram** in the README (`docs/rexy-flow.svg`).
+- **`--csp-override` option for `rexy run`**: Replaces all `Content-Security-Policy` headers of responses served from `--target` with the given policy (`off` removes the header entirely). Production passthrough traffic is untouched.
