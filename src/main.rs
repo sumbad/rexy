@@ -10,7 +10,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 
 use browser::resolve_browser;
-use proxy_handler::DevRedirect;
+use proxy_handler::{CspOverride, DevRedirect};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -56,6 +56,11 @@ struct RunArgs {
     /// Local proxy port. 0 means choose a free port.
     #[arg(long, default_value_t = 0)]
     proxy_port: u16,
+
+    /// Override the Content-Security-Policy of responses served from --target.
+    /// Pass `off` to remove the header entirely.
+    #[arg(long)]
+    csp_override: Option<String>,
 
     /// Browser arguments after `--`.
     #[arg(last = true, trailing_var_arg = true)]
@@ -109,6 +114,8 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     validate_path(&args.path)?;
     validate_target(&args.target)?;
 
+    let csp_override = parse_csp_override(&args.csp_override)?;
+
     ca::ensure_exists()?;
 
     if !trust::is_likely_installed() {
@@ -149,7 +156,7 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         proxy_host.clone(),
         proxy_path.clone(),
         local_target.clone(),
-        None,
+        csp_override,
     );
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -258,10 +265,74 @@ fn validate_target(target: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn parse_csp_override(
+    raw: &Option<String>,
+) -> Result<Option<CspOverride>, Box<dyn std::error::Error>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+
+    let value = raw.trim();
+
+    if value.is_empty() {
+        return Err("--csp-override cannot be empty: pass a policy or 'off'".into());
+    }
+
+    if value.eq_ignore_ascii_case("off") {
+        return Ok(Some(CspOverride::Off));
+    }
+
+    // Rejects newlines and non-visible-ASCII bytes (header injection guard).
+    if hudsucker::hyper::header::HeaderValue::from_str(value).is_err() {
+        return Err(format!(
+            "--csp-override contains characters invalid for an HTTP header: {value:?}"
+        )
+        .into());
+    }
+
+    Ok(Some(CspOverride::Policy(value.to_string())))
+}
+
 fn init_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "dev_proxy=info,hudsucker=info".into()),
         )
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csp_override_none_when_flag_absent() {
+        assert_eq!(parse_csp_override(&None).unwrap(), None);
+    }
+
+    #[test]
+    fn csp_override_parses_off() {
+        assert_eq!(
+            parse_csp_override(&Some("off".into())).unwrap(),
+            Some(CspOverride::Off)
+        );
+    }
+
+    #[test]
+    fn csp_override_parses_policy() {
+        assert_eq!(
+            parse_csp_override(&Some("frame-ancestors *".into())).unwrap(),
+            Some(CspOverride::Policy("frame-ancestors *".into()))
+        );
+    }
+
+    #[test]
+    fn csp_override_rejects_empty() {
+        assert!(parse_csp_override(&Some("   ".into())).is_err());
+    }
+
+    #[test]
+    fn csp_override_rejects_header_injection() {
+        assert!(parse_csp_override(&Some("frame-ancestors *\nX-Evil: y".into())).is_err());
+    }
 }
