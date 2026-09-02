@@ -16,6 +16,8 @@ npm-package = "rexy"
 clap = { version = "4", features = ["derive"] }
 hudsucker = "0.25"
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
 tokio = { version = "1", features = [
   "macros",
   "rt-multi-thread",

@@ -1,5 +1,6 @@
 mod browser;
 mod ca;
+mod config;
 mod pac;
 mod proxy_handler;
 mod trust;

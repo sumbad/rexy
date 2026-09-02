@@ -71,6 +71,10 @@ impl RedirectRule {
         &self.local_target
     }
 
+    pub fn csp_override(&self) -> Option<&CspOverride> {
+        self.csp_override.as_ref()
+    }
+
     fn matches_host(&self, host: &str) -> bool {
         normalize_host(host) == self.prod_host
     }
