@@ -6,11 +6,12 @@ mod proxy_handler;
 mod trust;
 
 use clap::{Parser, Subcommand};
-use hudsucker::{Proxy, rustls::crypto::aws_lc_rs};
+use hudsucker::Proxy;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
 use browser::resolve_browser;
+use hyper_rustls::ConfigBuilderExt;
 use proxy_handler::{DevRedirect, RedirectRule};
 
 #[derive(Debug, Parser)]
@@ -159,10 +160,25 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
+    // Upstream TLS must trust what the OS trusts (keychain), not just the
+    // bundled webpki roots — dev targets routinely use internal or mkcert CAs.
+    let upstream_tls = hudsucker::rustls::ClientConfig::builder_with_provider(
+        hudsucker::rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()?
+    .with_native_roots()?
+    .with_no_client_auth();
+
+    let upstream_connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(upstream_tls)
+        .https_or_http()
+        .enable_http1()
+        .build();
+
     let proxy = Proxy::builder()
         .with_listener(listener)
         .with_ca(ca)
-        .with_rustls_connector(aws_lc_rs::default_provider())
+        .with_http_connector(upstream_connector)
         .with_http_handler(handler.clone())
         .with_graceful_shutdown(async move {
             let _ = stop_rx.await;
