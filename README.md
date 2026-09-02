@@ -103,6 +103,8 @@ rexy trust
 
 ## Usage
 
+Single rule via flags:
+
 ```
 rexy run --host <host> --path <path> --target <url> -- <browser args>
 ```
@@ -132,6 +134,34 @@ rexy run \
 
 `--csp-override off` removes the header entirely. Only responses actually redirected to `--target` are affected; production passthrough traffic and `Content-Security-Policy-Report-Only` are never modified.
 
+### Multiple rules via a config file
+
+Pass `--file`/`-f` with a TOML file to intercept several hosts with one browser:
+
+```toml
+# rules.toml
+[[rules]]
+host = "calls-app.example.com"
+path = "/"
+target = "https://dev-calls.example.internal"
+csp_override = "frame-ancestors *"   # optional; "off" removes the header
+
+[[rules]]
+host = "other.example.com"
+path = "/app/"
+target = "http://127.0.0.1:3000"
+# csp_override omitted = CSP is not modified
+```
+
+```sh
+rexy run --file rules.toml
+```
+
+- `--file` cannot be combined with `--host`, `--path`, `--target` or `--csp-override` — those configure a single rule.
+- `--browser`, `--proxy-port` and browser arguments after `--` stay on the command line.
+- The first matching rule wins (host + path prefix).
+- An empty `rules` list is allowed: rexy logs a warning and runs without redirects.
+
 ### Commands
 
 | Command       | Description                                        |
@@ -145,6 +175,7 @@ rexy run \
 | Option                     | Default    | Description                                                        |
 | -------------------------- | ---------- | ------------------------------------------------------------------ |
 | `--browser <name or path>` | `chrome`   | `chrome`, `chromium`, or a path to a browser executable            |
+| `--file <path>` (`-f`)     | —          | TOML file with `[[rules]]`; excludes `--host/--path/--target/--csp-override` |
 | `--host <host>`            | —          | Production hostname to intercept (hostname only, no path/scheme)   |
 | `--path <prefix>`          | `/`        | Production path prefix to redirect (must start with `/`)           |
 | `--target <url>`           | —          | Local development server (`http://` or `https://`)                 |
@@ -164,7 +195,7 @@ RUST_LOG=debug rexy run ...
 
 - `ca/rexy.key` is the private key of your local CA. It never leaves your machine and must **never** be committed.
 - The CA is scoped to this machine's development use. Regenerate it if it may have leaked, then re-run `rexy trust`.
-- Only traffic to the `--host` you explicitly pass is intercepted and decrypted.
+- Only traffic to the hosts you explicitly configure (via `--host` or rules in `--file`) is intercepted and decrypted.
 
 ## License
 

@@ -17,3 +17,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`rexy trust` / `rexy clean` commands**: Install/remove the Rexy Local CA in the OS trust store on macOS, Windows, and Linux.
 - **`generate_ca.sh` script**: One-time local CA generation (EC P-256).
 - **`--csp-override` option for `rexy run`**: Replaces all `Content-Security-Policy` headers of responses served from `--target` with the given policy (`off` removes the header entirely).
+- **`--file` option for `rexy run`**: TOML rules file for multi-host redirects — several `host/path/target` rules with per-rule `csp_override` in one browser session. Excludes `--host/--path/--target/--csp-override`; an empty rules list logs a warning and runs without redirects.
