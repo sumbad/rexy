@@ -10,7 +10,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 
 use browser::resolve_browser;
-use proxy_handler::{CspOverride, DevRedirect};
+use proxy_handler::{CspOverride, DevRedirect, RedirectRule};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -152,12 +152,12 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let ca = ca::load_ca()?;
 
-    let handler = DevRedirect::new(
+    let handler = DevRedirect::new(vec![RedirectRule::new(
         proxy_host.clone(),
         proxy_path.clone(),
         local_target.clone(),
         csp_override,
-    );
+    )]);
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 

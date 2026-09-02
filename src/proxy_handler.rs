@@ -34,24 +34,17 @@ fn apply_csp_override(headers: &mut HeaderMap, csp: &CspOverride) {
     }
 }
 
+/// One redirect rule: which host/path prefix to intercept and which local
+/// target to serve it from.
 #[derive(Clone, Debug)]
-pub struct DevRedirect {
+pub struct RedirectRule {
     prod_host: String,
     path_prefix: String,
     local_target: String,
     csp_override: Option<CspOverride>,
-    /// Outcome of the most recent request handled by this instance, consumed
-    /// by `handle_response` of the same request.
-    ///
-    /// hudsucker clones the handler per request, so this must NOT be an
-    /// accumulating structure: a `VecDeque` would leak entries from the
-    /// CONNECT phase into every clone (clones are made from the instance that
-    /// already processed CONNECT). Overwriting the field in
-    /// `handle_request` makes inherited values irrelevant.
-    redirected: Option<bool>,
 }
 
-impl DevRedirect {
+impl RedirectRule {
     pub fn new(
         prod_host: String,
         path_prefix: String,
@@ -63,8 +56,19 @@ impl DevRedirect {
             path_prefix: normalize_path_prefix(&path_prefix),
             local_target: local_target.trim_end_matches('/').to_string(),
             csp_override,
-            redirected: None,
         }
+    }
+
+    pub fn host(&self) -> &str {
+        &self.prod_host
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path_prefix
+    }
+
+    pub fn target(&self) -> &str {
+        &self.local_target
     }
 
     fn matches_host(&self, host: &str) -> bool {
@@ -102,6 +106,37 @@ impl DevRedirect {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct DevRedirect {
+    rules: Vec<RedirectRule>,
+    /// CSP override of the most recent matched request, consumed by
+    /// `handle_response` of the same request.
+    ///
+    /// hudsucker clones the handler per request, so this must NOT be an
+    /// accumulating structure: a queue would leak entries from the CONNECT
+    /// phase into every clone (clones are made from the instance that already
+    /// processed CONNECT). Overwriting the field in `handle_request` makes
+    /// inherited values irrelevant.
+    pending_csp: Option<CspOverride>,
+}
+
+impl DevRedirect {
+    pub fn new(rules: Vec<RedirectRule>) -> Self {
+        Self {
+            rules,
+            pending_csp: None,
+        }
+    }
+
+    fn matching_rule(&self, req: &Request<Body>) -> Option<&RedirectRule> {
+        self.rules.iter().find(|rule| rule.matches_request(req))
+    }
+
+    fn matches_any_host(&self, host: &str) -> bool {
+        self.rules.iter().any(|rule| rule.matches_host(host))
+    }
+}
+
 impl HttpHandler for DevRedirect {
     async fn should_intercept_tls(
         &mut self,
@@ -112,7 +147,7 @@ impl HttpHandler for DevRedirect {
             return false;
         };
 
-        self.matches_host(server_name)
+        self.matches_any_host(server_name)
     }
 
     async fn handle_request(
@@ -130,33 +165,35 @@ impl HttpHandler for DevRedirect {
 
 impl DevRedirect {
     fn handle_request_inner(&mut self, mut req: Request<Body>) -> Request<Body> {
-        let redirected = self.rewrite_request(&mut req);
+        let pending_csp = self.rewrite_request(&mut req);
 
-        self.redirected = Some(redirected);
+        self.pending_csp = pending_csp;
 
         req
     }
 
-    fn rewrite_request(&mut self, req: &mut Request<Body>) -> bool {
+    fn rewrite_request(&self, req: &mut Request<Body>) -> Option<CspOverride> {
+        let matched = self.matching_rule(req);
+
         tracing::info!(
             method = %req.method(),
             host = ?req.headers().get(header::HOST),
             uri = %req.uri(),
-            matches = self.matches_request(req),
+            matches = matched.is_some(),
             "HTTP request"
         );
 
-        if !self.matches_request(req) {
-            return false;
-        }
+        let Some(rule) = matched else {
+            return None;
+        };
 
-        let Some(new_uri) = self.target_uri(req) else {
+        let Some(new_uri) = rule.target_uri(req) else {
             tracing::error!(
                 uri = ?req.uri(),
                 "failed to construct local target URI"
             );
 
-            return false;
+            return None;
         };
 
         let path_and_query = req
@@ -168,15 +205,15 @@ impl DevRedirect {
 
         *req.uri_mut() = new_uri;
 
-        let host_value = match local_target_host(&self.local_target) {
+        let host_value = match local_target_host(&rule.local_target) {
             Some(host) => host,
             None => {
                 tracing::error!(
-                    target = %self.local_target,
+                    target = %rule.local_target,
                     "failed to extract local target host"
                 );
 
-                return false;
+                return None;
             }
         };
 
@@ -185,20 +222,18 @@ impl DevRedirect {
         }
 
         tracing::info!(
-            host = %self.prod_host,
+            host = %rule.prod_host,
             path = %path_and_query,
-            target = %self.local_target,
+            target = %rule.local_target,
             "redirecting request to local dev server"
         );
 
-        true
+        rule.csp_override.clone()
     }
 
     fn handle_response_inner(&mut self, mut res: Response<Body>) -> Response<Body> {
-        let redirected = self.redirected.take().unwrap_or(false);
-
-        if redirected && let Some(csp_override) = &self.csp_override {
-            apply_csp_override(res.headers_mut(), csp_override);
+        if let Some(csp_override) = self.pending_csp.take() {
+            apply_csp_override(res.headers_mut(), &csp_override);
 
             tracing::info!(?csp_override, "csp override applied to redirected response");
         }
@@ -306,12 +341,12 @@ mod tests {
     }
 
     fn handler(csp_override: Option<CspOverride>) -> DevRedirect {
-        DevRedirect::new(
+        DevRedirect::new(vec![RedirectRule::new(
             "example.com".into(),
             "/".into(),
             "http://127.0.0.1:5173".into(),
             csp_override,
-        )
+        )])
     }
 
     fn request_to(host: &str, path: &str) -> Request<Body> {
@@ -398,5 +433,85 @@ mod tests {
         let res = inner.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
 
         assert!(!res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+    }
+
+    fn multi_rule_handler() -> DevRedirect {
+        DevRedirect::new(vec![
+            RedirectRule::new(
+                "example.com".into(),
+                "/app/".into(),
+                "http://127.0.0.1:1111".into(),
+                Some(CspOverride::Policy("policy-a".into())),
+            ),
+            RedirectRule::new(
+                "example.com".into(),
+                "/".into(),
+                "http://127.0.0.1:2222".into(),
+                Some(CspOverride::Policy("policy-b".into())),
+            ),
+            RedirectRule::new(
+                "other.com".into(),
+                "/".into(),
+                "http://127.0.0.1:3333".into(),
+                Some(CspOverride::Off),
+            ),
+        ])
+    }
+
+    #[test]
+    fn first_matching_rule_wins() {
+        let mut h = multi_rule_handler();
+
+        let req = h.handle_request_inner(request_to("example.com", "/app/main.js"));
+        assert_eq!(req.uri().to_string(), "http://127.0.0.1:1111/app/main.js");
+
+        let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+
+        assert_eq!(res.headers()[header::CONTENT_SECURITY_POLICY], "policy-a");
+    }
+
+    #[test]
+    fn redirect_uses_matched_rule_target() {
+        let mut h = multi_rule_handler();
+
+        let req = h.handle_request_inner(request_to("example.com", "/other.js"));
+        assert_eq!(req.uri().to_string(), "http://127.0.0.1:2222/other.js");
+    }
+
+    #[test]
+    fn per_rule_csp_isolated() {
+        let mut h = DevRedirect::new(vec![
+            RedirectRule::new(
+                "plain.com".into(),
+                "/".into(),
+                "http://127.0.0.1:1111".into(),
+                None,
+            ),
+            RedirectRule::new(
+                "stripped.com".into(),
+                "/".into(),
+                "http://127.0.0.1:2222".into(),
+                Some(CspOverride::Off),
+            ),
+        ]);
+
+        let req = request_to("plain.com", "/");
+        let _ = h.handle_request_inner(req);
+
+        let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+
+        assert_eq!(
+            res.headers()[header::CONTENT_SECURITY_POLICY],
+            "frame-ancestors 'self'"
+        );
+    }
+
+    #[test]
+    fn matches_any_host_across_rules() {
+        let h = multi_rule_handler();
+
+        assert!(h.matches_any_host("example.com"));
+        assert!(h.matches_any_host("other.com"));
+        assert!(!h.matches_any_host("third.com"));
     }
 }
