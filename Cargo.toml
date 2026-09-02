@@ -10,7 +10,7 @@ license = "MIT"
 readme = "README.md"
 
 [package.metadata.dist]
-npm-package = "rexy"
+npm-package = "rexy-cli"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

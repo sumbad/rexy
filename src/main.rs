@@ -173,10 +173,13 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     for rule in handler.rules() {
         info!(
-            "redirect: https://{}{}* -> {}",
+            "redirect: https://{}{}* -> {}{}",
             rule.host(),
             rule.path(),
-            rule.target()
+            rule.target(),
+            rule.csp_override()
+                .map(|csp| format!(" (csp override: {csp:?})"))
+                .unwrap_or_default()
         );
     }
 

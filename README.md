@@ -67,7 +67,7 @@ Alternatively, you can install `rexy` by downloading a pre-compiled binary from 
 If you have Node.js installed, you can install `rexy` directly from npm:
 
 ```bash
-npm install -g rexy
+npm install -g rexy-cli
 ```
 
 ### Install via Cargo (crates.io)

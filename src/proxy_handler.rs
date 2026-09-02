@@ -191,9 +191,7 @@ impl DevRedirect {
             "HTTP request"
         );
 
-        let Some(rule) = matched else {
-            return None;
-        };
+        let rule = matched?;
 
         let Some(new_uri) = rule.target_uri(req) else {
             tracing::error!(
