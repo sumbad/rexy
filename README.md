@@ -141,20 +141,18 @@ Pass `--file`/`-f` with a TOML file to intercept several hosts with one browser:
 ```toml
 # rules.toml
 [[rules]]
-host = "calls-app.example.com"
+host = "app.example.com"
 path = "/"
-target = "https://dev-calls.example.internal"
+target = "https://dev-app.example.internal"
 csp_override = "frame-ancestors *"   # optional; "off" removes the header
 
 [[rules]]
 host = "other.example.com"
-path = "/app/"
 target = "http://127.0.0.1:3000"
-# csp_override omitted = CSP is not modified
 ```
 
 ```sh
-rexy run --file rules.toml
+rexy run -f rules.toml
 ```
 
 - `--file` cannot be combined with `--host`, `--path`, `--target` or `--csp-override` — those configure a single rule.
