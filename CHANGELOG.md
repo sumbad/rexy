@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **CSP override was never applied**: request→response correlation state leaked through per-request handler clones (hudsucker reuses the CONNECT-phase instance as the clone source), so the override header silently stayed the target's original one. Correlation now uses overwrite semantics; a regression test emulates the clone chain.
+- **Upstream TLS now trusts the OS certificate store** instead of only the bundled webpki roots — `https://` targets with internal or mkcert CAs no longer fail with `invalid peer certificate: UnknownIssuer`. Hostname validation is unchanged: the target hostname must match the certificate SANs.
+- **Default `RUST_LOG` filter** referenced the old crate name (`dev_proxy`); it is now `rexy`.
+
 ## [0.1.0] - 2026-09-02
 
 ### Added
