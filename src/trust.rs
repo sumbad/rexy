@@ -147,7 +147,7 @@ fn check_macos() -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn install_windows(cert: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn install_windows(cert: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     run(
         "certutil",
         &[
@@ -178,7 +178,7 @@ fn check_windows() -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn install_linux(cert: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn install_linux(cert: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let status = std::process::Command::new("pkexec")
         .args([
             "cp",
@@ -214,7 +214,7 @@ fn remove_linux() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(target_os = "linux")]
 fn check_linux() -> bool {
-    Path::new("/usr/local/share/ca-certificates/local-dev-proxy.crt").exists()
+    std::path::Path::new("/usr/local/share/ca-certificates/local-dev-proxy.crt").exists()
 }
 
 fn run(program: &str, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
