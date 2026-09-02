@@ -5,9 +5,20 @@ use tokio::net::{TcpListener, TcpStream};
 /// everything else (messenger, WebRTC/STUN, long-poll, CDN) go DIRECT. Without this, the
 /// browser sends *all* traffic through the proxy, whose CONNECT passthrough for
 /// non-intercepted hosts breaks the calls signaling/media.
-pub fn content(host: &str, proxy_port: u16) -> String {
-    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    let host_cond = format!("host === \"{host}\" || host.endsWith(\".{host}\")");
+pub fn content(hosts: &[String], proxy_port: u16) -> String {
+    let conditions: Vec<String> = hosts
+        .iter()
+        .map(|host| {
+            let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+            format!("host === \"{host}\" || host.endsWith(\".{host}\")")
+        })
+        .collect();
+
+    let host_cond = if conditions.is_empty() {
+        "false".to_string()
+    } else {
+        conditions.join("\n    || ")
+    };
 
     r#"function FindProxyForURL(url, host) {
   host = host.toLowerCase();
@@ -61,4 +72,26 @@ async fn handle(mut socket: TcpStream, content: String) {
 
     let _ = socket.write_all(response.as_bytes()).await;
     let _ = socket.shutdown().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pac_contains_all_hosts() {
+        let pac = content(&["a.example.com".into(), "b.example.com".into()], 8888);
+
+        assert!(pac.contains("host === \"a.example.com\" || host.endsWith(\".a.example.com\")"));
+        assert!(pac.contains("host === \"b.example.com\" || host.endsWith(\".b.example.com\")"));
+        assert!(pac.contains("PROXY 127.0.0.1:8888"));
+    }
+
+    #[test]
+    fn pac_empty_hosts_routes_direct() {
+        let pac = content(&[], 8888);
+
+        assert!(pac.contains("if (false)"));
+        assert!(pac.contains("PROXY 127.0.0.1:8888"));
+    }
 }

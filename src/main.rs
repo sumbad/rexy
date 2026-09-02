@@ -141,7 +141,7 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // real-time calls).
     let pac_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let pac_addr = pac_listener.local_addr()?;
-    let pac_content = pac::content(&args.host, proxy_addr.port());
+    let pac_content = pac::content(&[args.host.clone()], proxy_addr.port());
     tokio::spawn(pac::serve(pac_listener, pac_content));
 
     let pac_url = format!("http://{pac_addr}/proxy.pac");
