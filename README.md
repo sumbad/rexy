@@ -43,7 +43,7 @@ Supported platforms: **macOS**, **Windows**, **Linux**.
 
 ### Quick Install (recommended)
 
-You can install `kley` with a single command using the installer script.
+You can install `rexy` with a single command using the installer script.
 
 **Linux / macOS:**
 ```bash
@@ -57,7 +57,7 @@ powershell -ExecutionPolicy Bypass -c "[Net.ServicePointManager]::SecurityProtoc
 
 ### Manual Installation
 
-Alternatively, you can install `kley` by downloading a pre-compiled binary from the [**Releases page**](https://github.com/sumbad/rexy/releases).
+Alternatively, you can install `rexy` by downloading a pre-compiled binary from the [**Releases page**](https://github.com/sumbad/rexy/releases).
 
 1.  Download the appropriate archive for your system.
 2.  Unpack the archive.
