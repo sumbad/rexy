@@ -132,6 +132,10 @@ impl DevRedirect {
         }
     }
 
+    pub fn rules(&self) -> &[RedirectRule] {
+        &self.rules
+    }
+
     fn matching_rule(&self, req: &Request<Body>) -> Option<&RedirectRule> {
         self.rules.iter().find(|rule| rule.matches_request(req))
     }

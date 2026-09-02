@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 
 use browser::resolve_browser;
-use proxy_handler::{CspOverride, DevRedirect, RedirectRule};
+use proxy_handler::{DevRedirect, RedirectRule};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -42,24 +42,28 @@ struct RunArgs {
     #[arg(long, default_value = "chrome")]
     browser: String,
 
-    /// Production hostname to intercept.
-    #[arg(long)]
-    host: String,
+    /// TOML file with [[rules]] entries; replaces --host/--path/--target/--csp-override.
+    #[arg(short, long)]
+    file: Option<String>,
 
-    /// Production path prefix to redirect.
-    #[arg(long, default_value = "/")]
-    path: String,
-
-    /// Local development server.
+    /// Production hostname to intercept (single-rule mode).
     #[arg(long)]
-    target: String,
+    host: Option<String>,
+
+    /// Production path prefix to redirect (single-rule mode).
+    #[arg(long)]
+    path: Option<String>,
+
+    /// Local development server (single-rule mode).
+    #[arg(long)]
+    target: Option<String>,
 
     /// Local proxy port. 0 means choose a free port.
     #[arg(long, default_value_t = 0)]
     proxy_port: u16,
 
     /// Override the Content-Security-Policy of responses served from --target.
-    /// Pass `off` to remove the header entirely.
+    /// Pass `off` to remove the header entirely. (single-rule mode)
     #[arg(long)]
     csp_override: Option<String>,
 
@@ -90,6 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => {
             println!("Use:");
             println!();
+            println!("  rexy run --file <rules.toml>");
             println!("  rexy run --host <host> --path <path> --target <url> -- <browser args>");
             println!();
             println!("Example:");
@@ -111,11 +116,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
-    validate_host(&args.host)?;
-    validate_path(&args.path)?;
-    validate_target(&args.target)?;
+    let rules = resolve_rules(&args)?;
 
-    let csp_override = parse_csp_override(&args.csp_override)?;
+    if rules.is_empty() {
+        tracing::warn!("config contains no rules; running without redirects");
+    }
 
     ca::ensure_exists()?;
 
@@ -136,29 +141,21 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(("127.0.0.1", args.proxy_port)).await?;
     let proxy_addr = listener.local_addr()?;
 
-    // Serve a PAC script that routes only the intercepted host through this proxy and lets
-    // everything else go DIRECT (otherwise the browser sends all traffic — messenger,
-    // WebRTC/STUN, long-poll — through the MITM proxy and its CONNECT passthrough breaks
-    // real-time calls).
+    // Serve a PAC script that routes only the intercepted hosts through this proxy and
+    // lets everything else go DIRECT (otherwise the browser sends all traffic —
+    // messenger, WebRTC/STUN, long-poll — through the MITM proxy and its CONNECT
+    // passthrough breaks real-time calls).
     let pac_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let pac_addr = pac_listener.local_addr()?;
-    let pac_content = pac::content(&[args.host.clone()], proxy_addr.port());
+    let pac_hosts: Vec<String> = rules.iter().map(|rule| rule.host().to_string()).collect();
+    let pac_content = pac::content(&pac_hosts, proxy_addr.port());
     tokio::spawn(pac::serve(pac_listener, pac_content));
 
     let pac_url = format!("http://{pac_addr}/proxy.pac");
 
-    let proxy_host = args.host.clone();
-    let proxy_path = args.path.clone();
-    let local_target = args.target.clone();
-
     let ca = ca::load_ca()?;
 
-    let handler = DevRedirect::new(vec![RedirectRule::new(
-        proxy_host.clone(),
-        proxy_path.clone(),
-        local_target.clone(),
-        csp_override,
-    )]);
+    let handler = DevRedirect::new(rules);
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -173,11 +170,17 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     info!("proxy listening on http://{proxy_addr}");
-    info!(
-        "redirect: https://{}{}* -> {}",
-        proxy_host, proxy_path, local_target
-    );
-    info!("TLS interception is restricted to host: {}", proxy_host);
+
+    for rule in handler.rules() {
+        info!(
+            "redirect: https://{}{}* -> {}",
+            rule.host(),
+            rule.path(),
+            rule.target()
+        );
+    }
+
+    info!("TLS interception is restricted to the configured rule hosts");
 
     let proxy_task = tokio::spawn(async move {
         if let Err(err) = proxy.start().await {
@@ -225,73 +228,43 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn validate_host(host: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if host.is_empty() {
-        return Err("--host cannot be empty".into());
-    }
-
-    if host.contains("://") {
-        return Err("--host must contain only hostname, e.g. superapp.example.com".into());
-    }
-
-    if host.contains('/') {
-        return Err("--host must not contain a path".into());
-    }
-
-    Ok(())
-}
-
-fn validate_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if !path.starts_with('/') {
-        return Err("--path must start with '/'".into());
-    }
-
-    Ok(())
-}
-
-fn validate_target(target: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let parsed: hudsucker::hyper::Uri = target.parse()?;
-
-    match parsed.scheme_str() {
-        Some("http" | "https") => {}
-        _ => {
-            return Err("--target must be an http:// or https:// URL".into());
+fn resolve_rules(args: &RunArgs) -> Result<Vec<RedirectRule>, Box<dyn std::error::Error>> {
+    if let Some(path) = &args.file {
+        if args.host.is_some()
+            || args.path.is_some()
+            || args.target.is_some()
+            || args.csp_override.is_some()
+        {
+            return Err(
+                "--file cannot be combined with --host, --path, --target or --csp-override; \
+                 configure rules inside the file"
+                    .into(),
+            );
         }
+
+        return config::load_rules(std::path::Path::new(path));
     }
 
-    if parsed.host().is_none() {
-        return Err("--target must contain a hostname".into());
-    }
+    let host = args
+        .host
+        .clone()
+        .ok_or("either --file or --host/--target are required")?;
+    let target = args
+        .target
+        .clone()
+        .ok_or("either --file or --host/--target are required")?;
+    let path = args.path.clone().unwrap_or_else(|| "/".into());
+    let csp_override = args
+        .csp_override
+        .as_deref()
+        .map(config::parse_csp_value)
+        .transpose()?;
 
-    Ok(())
-}
+    config::validate_host(&host)?;
+    config::validate_path(&path)?;
+    config::validate_target(&target)?;
 
-fn parse_csp_override(
-    raw: &Option<String>,
-) -> Result<Option<CspOverride>, Box<dyn std::error::Error>> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-
-    let value = raw.trim();
-
-    if value.is_empty() {
-        return Err("--csp-override cannot be empty: pass a policy or 'off'".into());
-    }
-
-    if value.eq_ignore_ascii_case("off") {
-        return Ok(Some(CspOverride::Off));
-    }
-
-    // Rejects newlines and non-visible-ASCII bytes (header injection guard).
-    if hudsucker::hyper::header::HeaderValue::from_str(value).is_err() {
-        return Err(format!(
-            "--csp-override contains characters invalid for an HTTP header: {value:?}"
-        )
-        .into());
-    }
-
-    Ok(Some(CspOverride::Policy(value.to_string())))
+    Ok(vec![RedirectRule::new(host, path, target, csp_override)])
 }
 
 fn init_logging() {
@@ -306,34 +279,79 @@ fn init_logging() {
 mod tests {
     use super::*;
 
-    #[test]
-    fn csp_override_none_when_flag_absent() {
-        assert_eq!(parse_csp_override(&None).unwrap(), None);
+    fn base_args() -> RunArgs {
+        RunArgs {
+            browser: "chrome".into(),
+            file: None,
+            host: None,
+            path: None,
+            target: None,
+            proxy_port: 0,
+            csp_override: None,
+            browser_args: vec![],
+        }
     }
 
     #[test]
-    fn csp_override_parses_off() {
-        assert_eq!(
-            parse_csp_override(&Some("off".into())).unwrap(),
-            Some(CspOverride::Off)
-        );
+    fn file_conflicts_with_single_rule_flags() {
+        let mut args = base_args();
+        args.file = Some("rules.toml".into());
+        args.host = Some("a.example.com".into());
+
+        assert!(resolve_rules(&args).is_err());
     }
 
     #[test]
-    fn csp_override_parses_policy() {
-        assert_eq!(
-            parse_csp_override(&Some("frame-ancestors *".into())).unwrap(),
-            Some(CspOverride::Policy("frame-ancestors *".into()))
-        );
+    fn single_rule_mode_requires_host_and_target() {
+        let args = base_args();
+        assert!(resolve_rules(&args).is_err());
+
+        let mut args = base_args();
+        args.host = Some("a.example.com".into());
+        assert!(resolve_rules(&args).is_err());
     }
 
     #[test]
-    fn csp_override_rejects_empty() {
-        assert!(parse_csp_override(&Some("   ".into())).is_err());
+    fn single_rule_mode_defaults_path() {
+        let mut args = base_args();
+        args.host = Some("a.example.com".into());
+        args.target = Some("http://127.0.0.1:1111".into());
+
+        let rules = resolve_rules(&args).unwrap();
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].host(), "a.example.com");
+        assert_eq!(rules[0].path(), "/");
+        assert_eq!(rules[0].target(), "http://127.0.0.1:1111");
     }
 
     #[test]
-    fn csp_override_rejects_header_injection() {
-        assert!(parse_csp_override(&Some("frame-ancestors *\nX-Evil: y".into())).is_err());
+    fn single_rule_mode_rejects_invalid_csp() {
+        let mut args = base_args();
+        args.host = Some("a.example.com".into());
+        args.target = Some("http://127.0.0.1:1111".into());
+        args.csp_override = Some("bad\nheader".into());
+
+        assert!(resolve_rules(&args).is_err());
+    }
+
+    #[test]
+    fn file_mode_loads_rules() {
+        let path = std::env::temp_dir().join(format!("rexy-cli-test-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "[[rules]]\nhost = \"a.example.com\"\ntarget = \"http://127.0.0.1:1111\"\n\n[[rules]]\nhost = \"b.example.com\"\ntarget = \"http://127.0.0.1:2222\"\n",
+        )
+        .unwrap();
+
+        let mut args = base_args();
+        args.file = Some(path.to_string_lossy().into_owned());
+
+        let rules = resolve_rules(&args).unwrap();
+
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[1].host(), "b.example.com");
+
+        std::fs::remove_file(&path).ok();
     }
 }
