@@ -41,20 +41,40 @@ Supported platforms: **macOS**, **Windows**, **Linux**.
 
 ## Install
 
-Once the first version is released, install from [GitHub Releases](https://github.com/sumbad/rexy/releases):
+### Quick Install (recommended)
 
-```sh
-# Cargo (crates.io)
-cargo install --locked rexy
+You can install `kley` with a single command using the installer script.
 
-# npm
-npm install -g rexy
-
-# Shell (macOS / Linux)
+**Linux / macOS:**
+```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/sumbad/rexy/releases/latest/download/rexy-installer.sh | sh
+```
 
-# PowerShell (Windows)
-irm https://github.com/sumbad/rexy/releases/latest/download/rexy-installer.ps1 | iex
+**Windows:**
+```bash
+powershell -ExecutionPolicy Bypass -c "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; irm https://github.com/sumbad/rexy/releases/latest/download/rexy-installer.ps1 | iex"
+```
+
+### Manual Installation
+
+Alternatively, you can install `kley` by downloading a pre-compiled binary from the [**Releases page**](https://github.com/sumbad/rexy/releases).
+
+1.  Download the appropriate archive for your system.
+2.  Unpack the archive.
+3.  Move the `kley` binary to a directory in your system's `PATH` (e.g., `/usr/local/bin` on macOS/Linux).
+
+### Install via npm (Node.js)
+If you have Node.js installed, you can install `rexy` directly from npm:
+
+```bash
+npm install -g rexy
+```
+
+### Install via Cargo (crates.io)
+If you have Rust and Cargo installed, you can install `rexy` directly from crates.io:
+
+```bash
+cargo install --locked rexy
 ```
 
 Or build from source:
@@ -79,8 +99,7 @@ rexy trust
   `/usr/local/share/ca-certificates/local-dev-proxy.crt` and runs
   `update-ca-certificates` (via `pkexec`)
 
-`rexy trust` is idempotent: re-running it after regenerating the CA replaces the old
-certificate. `rexy clean` removes the CA from the trust store.
+`rexy trust` is idempotent: re-running it after regenerating the CA replaces the old certificate. `rexy clean` removes the CA from the trust store.
 
 ## Usage
 
@@ -88,34 +107,30 @@ certificate. `rexy clean` removes the CA from the trust store.
 rexy run --host <host> --path <path> --target <url> -- <browser args>
 ```
 
-Example — serve the production mini-app from a local Vite dev server:
+Example serves an url from a local Vite dev server:
 
 ```sh
 rexy run \
   --browser chrome \
-  --host superapp.example.com \
-  --path /mini-app/ \
+  --host example.com \
+  --path /app/ \
   --target http://127.0.0.1:5173 \
-  -- --new-window https://superapp.example.com/mini-app/foo
+  -- --new-window https://example.com/app/foo
 ```
 
-If the target server sends a restrictive `Content-Security-Policy` that breaks
-the proxied page (e.g. `frame-ancestors` blocks embedding it in a parent
-shell), override the header for responses served from the target:
+If the target server sends a restrictive `Content-Security-Policy` that breaks the proxied page (e.g. `frame-ancestors` blocks embedding it in a parent shell), override the header for responses served from the target:
 
 ```sh
 rexy run \
   --browser chrome \
-  --host calls-app.example.com \
+  --host example.com \
   --path / \
   --target https://dev.example.internal \
   --csp-override "frame-ancestors *" \
-  -- --new-window https://calls-app.example.com/
+  -- --new-window https://app.example.com/
 ```
 
-`--csp-override off` removes the header entirely. Only responses actually
-redirected to `--target` are affected; production passthrough traffic and
-`Content-Security-Policy-Report-Only` are never modified.
+`--csp-override off` removes the header entirely. Only responses actually redirected to `--target` are affected; production passthrough traffic and `Content-Security-Policy-Report-Only` are never modified.
 
 ### Commands
 
@@ -147,10 +162,8 @@ RUST_LOG=debug rexy run ...
 
 ## Security notes
 
-- `ca/rexy.key` is the private key of your local CA. It never leaves your machine and
-  must **never** be committed — the repo's `.gitignore` already excludes `ca/`.
-- The CA is scoped to this machine's development use. Regenerate it if it may have
-  leaked, then re-run `rexy trust`.
+- `ca/rexy.key` is the private key of your local CA. It never leaves your machine and must **never** be committed.
+- The CA is scoped to this machine's development use. Regenerate it if it may have leaked, then re-run `rexy trust`.
 - Only traffic to the `--host` you explicitly pass is intercepted and decrypted.
 
 ## License
