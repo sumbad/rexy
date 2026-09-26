@@ -80,11 +80,14 @@ impl RedirectRule {
     }
 
     fn matches_request(&self, req: &Request<Body>) -> bool {
+        // HTTP/2 requests carry the authority in the URI (`:authority`), not a
+        // `host` header — fall back to the URI host so those requests still match.
         let host = req
             .headers()
             .get(header::HOST)
             .and_then(|value| value.to_str().ok())
-            .map(normalize_host);
+            .map(normalize_host)
+            .or_else(|| req.uri().host().map(normalize_host));
 
         let Some(host) = host else {
             return false;
@@ -368,6 +371,25 @@ mod tests {
         res.headers_mut()
             .insert(header::CONTENT_SECURITY_POLICY, policy.parse().unwrap());
         res
+    }
+
+    #[test]
+    fn rule_matches_http2_request_without_host_header() {
+        // HTTP/2 carries the authority in the URI (`:authority`), not a `host`
+        // header — matching must fall back to the URI host, or such requests
+        // silently bypass the redirect.
+        let rule = RedirectRule::new(
+            "example.com".into(),
+            "/".into(),
+            "http://127.0.0.1:5173".into(),
+            None,
+        );
+        let req = Request::builder()
+            .uri("https://example.com/app.js")
+            .body(Body::empty())
+            .unwrap();
+
+        assert!(rule.matches_request(&req));
     }
 
     #[test]

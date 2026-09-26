@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **`REXY_PAC_ALL=1` env for `rexy run`**: routes *every* host through the proxy instead of only the intercepted ones (PAC returns `PROXY` unconditionally). Diagnostic-only escape hatch — it defeats the `DIRECT` optimization so traffic the browser would otherwise keep on a direct connection becomes interceptable (e.g. HTTP/2 long-polls). WebRTC/media may break while it is on.
+
+### Fixed
+
+- **Rule matching missed HTTP/2 requests**: rules matched on the `host` header only, which HTTP/2 requests don't carry (they use the `:authority` pseudo-header). Such requests were never redirected and silently went to prod. Matching now falls back to the request URI host when the `host` header is absent.
+
 ## [0.2.0] - 2026-09-03
 
 ### Added

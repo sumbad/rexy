@@ -5,7 +5,11 @@ use tokio::net::{TcpListener, TcpStream};
 /// everything else (messenger, WebRTC/STUN, long-poll, CDN) go DIRECT. Without this, the
 /// browser sends *all* traffic through the proxy, whose CONNECT passthrough for
 /// non-intercepted hosts breaks the calls signaling/media.
-pub fn content(hosts: &[String], proxy_port: u16) -> String {
+///
+/// When `route_all` is true (env `REXY_PAC_ALL=1`) every host is routed through the proxy.
+/// Diagnostic-only: it defeats the DIRECT optimization to make ALL traffic (including
+/// connections the browser would otherwise keep direct) observable/interceptable.
+pub fn content(hosts: &[String], proxy_port: u16, route_all: bool) -> String {
     let conditions: Vec<String> = hosts
         .iter()
         .map(|host| {
@@ -14,7 +18,9 @@ pub fn content(hosts: &[String], proxy_port: u16) -> String {
         })
         .collect();
 
-    let host_cond = if conditions.is_empty() {
+    let host_cond = if route_all {
+        "true".to_string()
+    } else if conditions.is_empty() {
         "false".to_string()
     } else {
         conditions.join("\n    || ")
@@ -80,7 +86,7 @@ mod tests {
 
     #[test]
     fn pac_contains_all_hosts() {
-        let pac = content(&["a.example.com".into(), "b.example.com".into()], 8888);
+        let pac = content(&["a.example.com".into(), "b.example.com".into()], 8888, false);
 
         assert!(pac.contains("host === \"a.example.com\" || host.endsWith(\".a.example.com\")"));
         assert!(pac.contains("host === \"b.example.com\" || host.endsWith(\".b.example.com\")"));
@@ -89,7 +95,7 @@ mod tests {
 
     #[test]
     fn pac_empty_hosts_routes_direct() {
-        let pac = content(&[], 8888);
+        let pac = content(&[], 8888, false);
 
         assert!(pac.contains("if (false)"));
         assert!(pac.contains("PROXY 127.0.0.1:8888"));

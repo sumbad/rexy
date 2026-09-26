@@ -27,7 +27,7 @@ build.
      subdomains) through the proxy — everything else goes `DIRECT`, so messengers,
      WebRTC/STUN, long-poll and CDNs are unaffected,
    - launches the browser with `--proxy-pac-url=...` and `--disable-quic`,
-   - rewrites matching requests: `https://<host><path>*` → `<target>`.
+   - rewrites matching requests: `https://<host><path>*` → `<target>` (matching uses the `host` header, falling back to the request URI authority so HTTP/2 requests, which have no `host` header, are matched too).
 4. TLS interception is restricted to the intercepted host only.
 
 Ctrl+C stops the browser and the proxy.
@@ -188,6 +188,13 @@ Logging is controlled by `RUST_LOG` (via `tracing-subscriber`), e.g.:
 ```sh
 RUST_LOG=debug rexy run ...
 ```
+
+### Environment variables
+
+| Variable       | Default | Description                                                                                       |
+| -------------- | ------- | ------------------------------------------------------------------------------------------------- |
+| `RUST_LOG`     | —       | `tracing` log filter (see [Logging](#logging))                                                      |
+| `REXY_PAC_ALL` | unset   | When `1`, the PAC routes **every** host through the proxy (not just intercepted ones). Diagnostic escape hatch: it defeats the `DIRECT` optimization so traffic the browser would otherwise keep on a direct connection (e.g. HTTP/2 long-polls) becomes interceptable. WebRTC/media may break while it is on. |
 
 ## Security notes
 

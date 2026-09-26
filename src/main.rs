@@ -149,7 +149,8 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let pac_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let pac_addr = pac_listener.local_addr()?;
     let pac_hosts: Vec<String> = rules.iter().map(|rule| rule.host().to_string()).collect();
-    let pac_content = pac::content(&pac_hosts, proxy_addr.port());
+    let route_all = std::env::var("REXY_PAC_ALL").map(|v| v == "1").unwrap_or(false);
+    let pac_content = pac::content(&pac_hosts, proxy_addr.port(), route_all);
     tokio::spawn(pac::serve(pac_listener, pac_content));
 
     let pac_url = format!("http://{pac_addr}/proxy.pac");
