@@ -40,18 +40,24 @@ pub fn content(hosts: &[String], proxy_port: u16, route_all: bool) -> String {
 
 /// Minimal one-shot HTTP server serving the PAC script. Chromium fetches the PAC script URL
 /// directly (before applying the PAC), so a plain 127.0.0.1 listener is sufficient.
-pub async fn serve(listener: TcpListener, content: String) {
+///
+/// The content lives behind a shared lock: the hot-reload watcher swaps it
+/// when the rules file changes, and every fetch serves the current script.
+pub async fn serve(listener: TcpListener, content: std::sync::Arc<std::sync::RwLock<String>>) {
     loop {
         let Ok((socket, _)) = listener.accept().await else {
             continue;
         };
 
-        let content = content.clone();
+        let content = std::sync::Arc::clone(&content);
         tokio::spawn(handle(socket, content));
     }
 }
 
-async fn handle(mut socket: TcpStream, content: String) {
+async fn handle(
+    mut socket: TcpStream,
+    content: std::sync::Arc<std::sync::RwLock<String>>,
+) {
     // Consume the request until the end of the headers so the response is not interleaved
     // with a still-in-flight request. The PAC fetch is a tiny GET, so a single small buffer
     // covers it, but loop until we see the header terminator just in case.
@@ -70,10 +76,15 @@ async fn handle(mut socket: TcpStream, content: String) {
         }
     }
 
+    let current = content
+        .read()
+        .expect("PAC content lock is poisoned")
+        .clone();
+
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{}",
-        content.len(),
-        content
+        current.len(),
+        current
     );
 
     let _ = socket.write_all(response.as_bytes()).await;

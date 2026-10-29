@@ -160,6 +160,20 @@ rexy run -f rules.toml
 - The first matching rule wins (host + path prefix).
 - An empty `rules` list is allowed: rexy logs a warning and runs without redirects.
 
+### Hot reload of the rules file
+
+In `--file` mode rexy watches `rules.toml` and applies edits without restarting the proxy or the
+browser — the browser session (logins, profiles) survives. Changes are picked up within about a
+second:
+
+- The rule set is swapped atomically; in-flight requests are unaffected.
+- The PAC script is regenerated when the set of hosts changes. Note: the browser re-fetches the
+  PAC on its own schedule (network-change events), so routes for *new* hosts start working after
+  the next PAC fetch; edits to paths/targets of already-intercepted hosts apply immediately.
+- A broken file (bad TOML, validation error) never kills the proxy: rexy logs a warning and keeps
+  the previous rule set until a valid version is saved.
+- Single-rule mode (`--host/--path/--target`) has no file to watch — restart to change it.
+
 ### Commands
 
 | Command       | Description                                        |

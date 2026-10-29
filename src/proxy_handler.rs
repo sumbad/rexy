@@ -115,7 +115,9 @@ impl RedirectRule {
 
 #[derive(Clone, Debug)]
 pub struct DevRedirect {
-    rules: Vec<RedirectRule>,
+    /// Current rule set, shared with the hot-reload watcher: the watcher
+    /// swaps the contents while running handler clones keep reading.
+    rules: std::sync::Arc<std::sync::RwLock<Vec<RedirectRule>>>,
     /// CSP override of the most recent matched request, consumed by
     /// `handle_response` of the same request.
     ///
@@ -130,21 +132,38 @@ pub struct DevRedirect {
 impl DevRedirect {
     pub fn new(rules: Vec<RedirectRule>) -> Self {
         Self {
-            rules,
+            rules: std::sync::Arc::new(std::sync::RwLock::new(rules)),
             pending_csp: None,
         }
     }
 
-    pub fn rules(&self) -> &[RedirectRule] {
-        &self.rules
+    pub fn rules_handle(&self) -> std::sync::Arc<std::sync::RwLock<Vec<RedirectRule>>> {
+        std::sync::Arc::clone(&self.rules)
     }
 
-    fn matching_rule(&self, req: &Request<Body>) -> Option<&RedirectRule> {
-        self.rules.iter().find(|rule| rule.matches_request(req))
+    /// Snapshot of the current rules for startup logging.
+    pub fn rules(&self) -> Vec<RedirectRule> {
+        self.rules
+            .read()
+            .expect("rules lock is poisoned")
+            .clone()
+    }
+
+    fn matching_rule(&self, req: &Request<Body>) -> Option<RedirectRule> {
+        let rules = self.rules.read().expect("rules lock is poisoned");
+
+        rules
+            .iter()
+            .find(|rule| rule.matches_request(req))
+            .cloned()
     }
 
     fn matches_any_host(&self, host: &str) -> bool {
-        self.rules.iter().any(|rule| rule.matches_host(host))
+        self.rules
+            .read()
+            .expect("rules lock is poisoned")
+            .iter()
+            .any(|rule| rule.matches_host(host))
     }
 }
 
