@@ -181,6 +181,21 @@ rexy run -f rules.toml
 | `--csp-override <policy\|off>` | —      | Replace all `Content-Security-Policy` headers of responses served from `--target` (`off` removes them); passthrough traffic is untouched |
 | `-- <args>`                | —          | Extra arguments passed to the browser                              |
 
+### Rules status page
+
+While running, rexy serves a live status page — `http://127.0.0.1:8125/` by default (env
+`REXY_STATUS_PORT`, `0` picks a free port). It shows the fate of every intercepted connection and
+request: which rule matched (rule number → target) or why not (host not configured, no rule for
+the path), plus the response status and round-trip duration. The "the rule did not match,
+silently" class of problems becomes visible at a glance.
+
+- `GET /` — HTML page with live updates (Server-Sent Events).
+- `GET /events` — JSON array of the last 500 events, newest first — the feed for harness scripts.
+- `GET /stream` — SSE stream of new and updated events.
+
+If the port is busy, rexy logs a warning and runs without the page — the proxy itself is
+unaffected.
+
 ### Logging
 
 Logging is controlled by `RUST_LOG` (via `tracing-subscriber`), e.g.:
@@ -194,6 +209,7 @@ RUST_LOG=debug rexy run ...
 | Variable       | Default | Description                                                                                       |
 | -------------- | ------- | ------------------------------------------------------------------------------------------------- |
 | `RUST_LOG`     | —       | `tracing` log filter (see [Logging](#logging))                                                      |
+| `REXY_STATUS_PORT` | `8125`  | Port of the live [rules status page](#rules-status-page); `0` picks a free port. If the port is busy, rexy runs without the page. |
 | `REXY_PAC_ALL` | unset   | When `1`, the PAC routes **every** host through the proxy (not just intercepted ones). Diagnostic escape hatch: it defeats the `DIRECT` optimization so traffic the browser would otherwise keep on a direct connection (e.g. HTTP/2 long-polls) becomes interceptable. WebRTC/media may break while it is on. |
 
 ## Security notes

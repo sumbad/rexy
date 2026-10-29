@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use crate::status::{Decision, EventLog, now_ms};
 use hudsucker::{
     Body, HttpContext, HttpHandler, RequestOrResponse,
     hyper::{HeaderMap, Request, Response, Uri, header},
@@ -80,20 +83,11 @@ impl RedirectRule {
     }
 
     fn matches_request(&self, req: &Request<Body>) -> bool {
-        // HTTP/2 requests carry the authority in the URI (`:authority`), not a
-        // `host` header — fall back to the URI host so those requests still match.
-        let host = req
-            .headers()
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .map(normalize_host)
-            .or_else(|| req.uri().host().map(normalize_host));
-
-        let Some(host) = host else {
+        let Some(host) = Self::request_host(req) else {
             return false;
         };
 
-        if host != self.prod_host {
+        if normalize_host(&host) != self.prod_host {
             return false;
         }
 
@@ -113,25 +107,52 @@ impl RedirectRule {
     }
 }
 
+/// Per-request correlation: the status event id and CSP override of the most
+/// recent matched request, consumed by `handle_response` of the same request.
+///
+/// hudsucker clones the handler per request, so this must NOT be an
+/// accumulating structure: a queue would leak entries from the CONNECT
+/// phase into every clone (clones are made from the instance that already
+/// processed CONNECT). Overwriting the field in `handle_request` makes
+/// inherited values irrelevant.
+#[derive(Clone, Debug)]
+struct Pending {
+    event_id: u64,
+    started_ms: u64,
+    csp_override: Option<CspOverride>,
+}
+
+impl RedirectRule {
+    /// Host of an intercepted request: the `host` header, falling back to the
+    /// URI host — HTTP/2 requests carry the authority in `:authority`, not a
+    /// `host` header, so without the fallback they would never match.
+    fn request_host(req: &Request<Body>) -> Option<String> {
+        req.headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| req.uri().host().map(str::to_string))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DevRedirect {
     rules: Vec<RedirectRule>,
-    /// CSP override of the most recent matched request, consumed by
-    /// `handle_response` of the same request.
-    ///
-    /// hudsucker clones the handler per request, so this must NOT be an
-    /// accumulating structure: a queue would leak entries from the CONNECT
-    /// phase into every clone (clones are made from the instance that already
-    /// processed CONNECT). Overwriting the field in `handle_request` makes
-    /// inherited values irrelevant.
-    pending_csp: Option<CspOverride>,
+    /// Shared status event log: the status page server reads what we record.
+    events: Arc<EventLog>,
+    pending: Option<Pending>,
 }
 
 impl DevRedirect {
     pub fn new(rules: Vec<RedirectRule>) -> Self {
+        Self::with_events(rules, EventLog::new())
+    }
+
+    pub fn with_events(rules: Vec<RedirectRule>, events: Arc<EventLog>) -> Self {
         Self {
             rules,
-            pending_csp: None,
+            events,
+            pending: None,
         }
     }
 
@@ -139,13 +160,16 @@ impl DevRedirect {
         &self.rules
     }
 
-    fn matching_rule(&self, req: &Request<Body>) -> Option<&RedirectRule> {
-        self.rules.iter().find(|rule| rule.matches_request(req))
+    /// The shared event log handle for the status page server.
+    pub fn events_handle(&self) -> Arc<EventLog> {
+        Arc::clone(&self.events)
     }
 
-    fn matches_any_host(&self, host: &str) -> bool {
-        self.rules.iter().any(|rule| rule.matches_host(host))
+    /// Index (first-match-wins) of the rule matching the request.
+    fn matching_rule_index(&self, req: &Request<Body>) -> Option<usize> {
+        self.rules.iter().position(|rule| rule.matches_request(req))
     }
+
 }
 
 impl HttpHandler for DevRedirect {
@@ -155,10 +179,36 @@ impl HttpHandler for DevRedirect {
         client_hello: hudsucker::rustls::server::ClientHello<'_>,
     ) -> bool {
         let Some(server_name) = client_hello.server_name() else {
+            self.events.record_connect(
+                "",
+                Decision::Missed {
+                    reason: "no SNI in ClientHello".into(),
+                },
+            );
             return false;
         };
 
-        self.matches_any_host(server_name)
+        match self.rules.iter().position(|rule| rule.matches_host(server_name)) {
+            Some(index) => {
+                self.events.record_connect(
+                    server_name,
+                    Decision::Matched {
+                        rule_index: index,
+                        target: "(TLS decrypted)".into(),
+                    },
+                );
+                true
+            }
+            None => {
+                self.events.record_connect(
+                    server_name,
+                    Decision::Missed {
+                        reason: "host not configured".into(),
+                    },
+                );
+                false
+            }
+        }
     }
 
     async fn handle_request(
@@ -166,7 +216,7 @@ impl HttpHandler for DevRedirect {
         _ctx: &HttpContext,
         req: Request<Body>,
     ) -> RequestOrResponse {
-        RequestOrResponse::Request(self.handle_request_inner(req))
+        self.handle_request_inner(req)
     }
 
     async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
@@ -175,27 +225,70 @@ impl HttpHandler for DevRedirect {
 }
 
 impl DevRedirect {
-    fn handle_request_inner(&mut self, mut req: Request<Body>) -> Request<Body> {
-        let pending_csp = self.rewrite_request(&mut req);
-
-        self.pending_csp = pending_csp;
-
-        req
-    }
-
-    fn rewrite_request(&self, req: &mut Request<Body>) -> Option<CspOverride> {
-        let matched = self.matching_rule(req);
+    fn handle_request_inner(&mut self, mut req: Request<Body>) -> RequestOrResponse {
+        let matched_index = self.matching_rule_index(&req);
 
         tracing::info!(
             method = %req.method(),
             host = ?req.headers().get(header::HOST),
             uri = %req.uri(),
-            matches = matched.is_some(),
+            matches = matched_index.is_some(),
             "HTTP request"
         );
 
-        let rule = matched?;
+        let host = RedirectRule::request_host(&req).unwrap_or_default();
+        let path = req.uri().path().to_string();
+        let method = req.method().to_string();
+        let started_ms = now_ms();
 
+        let Some(rule_index) = matched_index else {
+            let reason = if self.rules.iter().any(|rule| rule.matches_host(&host)) {
+                "no rule matched the path"
+            } else {
+                "host not configured"
+            };
+
+            let event_id = self.events.record_request(
+                &method,
+                &host,
+                &path,
+                Decision::Missed {
+                    reason: reason.into(),
+                },
+            );
+            self.pending = Some(Pending {
+                event_id,
+                started_ms,
+                csp_override: None,
+            });
+
+            return RequestOrResponse::Request(req);
+        };
+
+        let rule = &self.rules[rule_index];
+
+        let event_id = self.events.record_request(
+            &method,
+            &host,
+            &path,
+            Decision::Matched {
+                rule_index,
+                target: rule.target().to_string(),
+            },
+        );
+
+        let pending_csp = self.rewrite_request(rule, &mut req);
+
+        self.pending = Some(Pending {
+            event_id,
+            started_ms,
+            csp_override: pending_csp,
+        });
+
+        RequestOrResponse::Request(req)
+    }
+
+    fn rewrite_request(&self, rule: &RedirectRule, req: &mut Request<Body>) -> Option<CspOverride> {
         let Some(new_uri) = rule.target_uri(req) else {
             tracing::error!(
                 uri = ?req.uri(),
@@ -241,10 +334,18 @@ impl DevRedirect {
     }
 
     fn handle_response_inner(&mut self, mut res: Response<Body>) -> Response<Body> {
-        if let Some(csp_override) = self.pending_csp.take() {
-            apply_csp_override(res.headers_mut(), &csp_override);
+        if let Some(pending) = self.pending.take() {
+            if let Some(csp_override) = &pending.csp_override {
+                apply_csp_override(res.headers_mut(), csp_override);
 
-            tracing::info!(?csp_override, "csp override applied to redirected response");
+                tracing::info!(?csp_override, "csp override applied to redirected response");
+            }
+
+            self.events.record_response(
+                pending.event_id,
+                res.status().as_u16(),
+                now_ms().saturating_sub(pending.started_ms),
+            );
         }
 
         res
@@ -490,7 +591,11 @@ mod tests {
     fn first_matching_rule_wins() {
         let mut h = multi_rule_handler();
 
-        let req = h.handle_request_inner(request_to("example.com", "/app/main.js"));
+        let RequestOrResponse::Request(req) =
+            h.handle_request_inner(request_to("example.com", "/app/main.js"))
+        else {
+            panic!("redirect rules must pass the request through");
+        };
         assert_eq!(req.uri().to_string(), "http://127.0.0.1:1111/app/main.js");
 
         let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
@@ -502,7 +607,11 @@ mod tests {
     fn redirect_uses_matched_rule_target() {
         let mut h = multi_rule_handler();
 
-        let req = h.handle_request_inner(request_to("example.com", "/other.js"));
+        let RequestOrResponse::Request(req) =
+            h.handle_request_inner(request_to("example.com", "/other.js"))
+        else {
+            panic!("redirect rules must pass the request through");
+        };
         assert_eq!(req.uri().to_string(), "http://127.0.0.1:2222/other.js");
     }
 
@@ -535,11 +644,11 @@ mod tests {
     }
 
     #[test]
-    fn matches_any_host_across_rules() {
+    fn rules_match_hosts_across_the_set() {
         let h = multi_rule_handler();
 
-        assert!(h.matches_any_host("example.com"));
-        assert!(h.matches_any_host("other.com"));
-        assert!(!h.matches_any_host("third.com"));
+        assert!(h.rules()[0].matches_host("example.com"));
+        assert!(h.rules()[2].matches_host("other.com"));
+        assert!(!h.rules()[0].matches_host("third.com"));
     }
 }
