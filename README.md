@@ -134,6 +134,28 @@ rexy run \
 
 `--csp-override off` removes the header entirely. Only responses actually redirected to `--target` are affected; production passthrough traffic and `Content-Security-Policy-Report-Only` are never modified.
 
+### Running an Electron app as the browser
+
+`--browser` accepts any executable, including an Electron app — the typical superapp workflow is
+to run the local shell through rexy instead of a plain browser:
+
+```sh
+rexy run   --browser /path/to/my-electron-app   --file rules.toml   -- --user-data-dir=/tmp/rexy-electron-profile --remote-debugging-port=9222      /path/to/my-electron-app --some-app-flag
+```
+
+- Everything after `--` is passed to the launched executable **as is** — rexy does not interpret
+  it. That passthrough is what lets you give the Electron app its own arguments (app path,
+  app flags, profile).
+- The proxy settings (PAC URL and `--disable-quic`) are added by rexy itself; the app does not
+  need to know about the proxy. The PAC-based routing works for Electron exactly like for
+  Chrome, because Electron is Chromium.
+- The CDP (remote debugging) port is an Electron/Chromium argument passed after `--`
+  (`--remote-debugging-port=9222`), not a rexy option — rexy never talks to it itself, tools
+  like `dev-workspace` connect to `127.0.0.1:9222` directly.
+- A separate `--user-data-dir` is recommended: Chrome ≥136 does not enable remote debugging on
+  the default profile, and an isolated profile keeps the session independent of your daily
+  browser.
+
 ### Multiple rules via a config file
 
 Pass `--file`/`-f` with a TOML file to intercept several hosts with one browser:
