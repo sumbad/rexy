@@ -181,6 +181,17 @@ rexy run -f rules.toml
 | `--csp-override <policy\|off>` | —      | Replace all `Content-Security-Policy` headers of responses served from `--target` (`off` removes them); passthrough traffic is untouched |
 | `-- <args>`                | —          | Extra arguments passed to the browser                              |
 
+### HTTP/2
+
+Rexy speaks HTTP/2 end-to-end for intercepted hosts: the browser connects to the proxy over h2 and
+the proxy negotiates h2 with the upstream via ALPN whenever the target supports it — multiplexing
+and long-poll behave like they do on prod. This matters for matching too: HTTP/2 requests carry
+the authority in the `:authority` pseudo-header instead of a `host` header, which is why rule
+matching falls back to the request URI host.
+
+HTTP/3/QUIC stays off: the browser is launched with `--disable-quic`, so all traffic remains
+TCP-based and interceptable.
+
 ### Logging
 
 Logging is controlled by `RUST_LOG` (via `tracing-subscriber`), e.g.:

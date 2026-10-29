@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **HTTP/2 end-to-end**: the hudsucker `http2` feature is enabled and the upstream connector negotiates h2 via ALPN — intercepted hosts now behave like on prod (multiplexing, long-poll) instead of being downgraded to HTTP/1.1. HTTP/3/QUIC remains off (`--disable-quic`).
 - **`REXY_PAC_ALL=1` env for `rexy run`**: routes *every* host through the proxy instead of only the intercepted ones (PAC returns `PROXY` unconditionally). Diagnostic-only escape hatch — it defeats the `DIRECT` optimization so traffic the browser would otherwise keep on a direct connection becomes interceptable (e.g. HTTP/2 long-polls). WebRTC/media may break while it is on.
 
 ### Fixed
