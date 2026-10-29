@@ -31,10 +31,18 @@ enum Command {
     Run(RunArgs),
 
     /// Install the Rexy Local CA into the OS trust store.
-    Trust,
+    Trust {
+        /// Install into Firefox profiles (NSS) instead of the OS store.
+        #[arg(long)]
+        firefox: bool,
+    },
 
     /// Remove the Rexy Local CA from the OS trust store.
-    Clean,
+    Clean {
+        /// Remove from Firefox profiles (NSS) instead of the OS store.
+        #[arg(long)]
+        firefox: bool,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -80,13 +88,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Trust) => {
-            trust::install()?;
+        Some(Command::Trust { firefox }) => {
+            if firefox {
+                trust::install_firefox()?;
+            } else {
+                trust::install()?;
+            }
             return Ok(());
         }
 
-        Some(Command::Clean) => {
-            trust::remove()?;
+        Some(Command::Clean { firefox }) => {
+            if firefox {
+                trust::remove_firefox()?;
+            } else {
+                trust::remove()?;
+            }
             return Ok(());
         }
 
@@ -125,7 +141,13 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     ca::ensure_exists()?;
 
-    if !trust::is_likely_installed() {
+    let browser = resolve_browser(&args.browser)?;
+
+    if browser.is_firefox() {
+        // Firefox uses its own NSS store: `rexy trust --firefox`, not the OS
+        // store, so the OS-trust gate does not apply here.
+        info!("Firefox browser: make sure the CA is in the profiles (rexy trust --firefox)");
+    } else if !trust::is_likely_installed() {
         eprintln!();
         eprintln!("Rexy Local CA is not installed in the OS trust store.");
         eprintln!("Run:");
@@ -136,8 +158,6 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!();
         std::process::exit(1);
     }
-
-    let browser = resolve_browser(&args.browser)?;
 
     let listener = TcpListener::bind(("127.0.0.1", args.proxy_port)).await?;
     let proxy_addr = listener.local_addr()?;

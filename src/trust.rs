@@ -1,3 +1,5 @@
+use std::fs;
+
 use crate::ca::cert_path;
 
 const CA_NAME: &str = "Rexy Local CA";
@@ -217,6 +219,220 @@ fn check_linux() -> bool {
     std::path::Path::new("/usr/local/share/ca-certificates/local-dev-proxy.crt").exists()
 }
 
+// ---------- Firefox (NSS) ----------
+
+/// Directory containing Firefox `profiles.ini`, per OS.
+fn firefox_profiles_ini() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        return Some(home.join("Library/Application Support/Firefox/profiles.ini"));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return Some(home.join(".mozilla/firefox/profiles.ini"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = std::env::var_os("APPDATA").map(std::path::PathBuf::from)?;
+        return Some(appdata.join("Mozilla/Firefox/profiles.ini"));
+    }
+
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Extract every `Path=` entry from a `profiles.ini`, resolved against the
+/// ini's directory (relative) or taken as-is (absolute). Both `[ProfileN]`
+/// and `[Install…]` sections carry a `Path=`.
+fn profile_dirs(ini_content: &str, base_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+
+    for line in ini_content.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+
+        if key.trim() != "Path" {
+            continue;
+        }
+
+        let value = value.trim();
+        let path = std::path::Path::new(value);
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base_dir.join(value)
+        };
+
+        if !dirs.contains(&resolved) {
+            dirs.push(resolved);
+        }
+    }
+
+    dirs
+}
+
+fn certutil_hint() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        return "certutil not found — install NSS tools: brew install nss";
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return "certutil not found — install NSS tools: sudo apt install libnss3-tools (Debian/Ubuntu)";
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return "certutil from NSS not found — install NSS tools (https://wiki.mozilla.org/NSS) and put certutil on PATH";
+    }
+
+    #[allow(unreachable_code)]
+    "certutil not found — install NSS tools"
+}
+
+/// Install the Rexy CA into every Firefox profile via certutil (NSS).
+pub fn install_firefox() -> Result<(), Box<dyn std::error::Error>> {
+    let ini = firefox_profiles_ini()
+        .ok_or("cannot locate the Firefox profiles directory (is Firefox installed?)")?;
+
+    if !ini.exists() {
+        return Err(format!(
+            "Firefox profiles.ini not found at {} — run Firefox once to create profiles",
+            ini.display()
+        )
+        .into());
+    }
+
+    let ini_dir = ini.parent().expect("profiles.ini has a parent").to_path_buf();
+    let ini_content = fs::read_to_string(&ini)?;
+    let dirs = profile_dirs(&ini_content, &ini_dir);
+
+    if dirs.is_empty() {
+        return Err("no Firefox profiles found in profiles.ini".into());
+    }
+
+    if which_certutil().is_none() {
+        return Err(certutil_hint().into());
+    }
+
+    let der = ca_der()?;
+
+    let mut installed = 0usize;
+    for dir in &dirs {
+        if !dir.exists() {
+            tracing::warn!(profile = %dir.display(), "profile directory missing, skipping");
+            continue;
+        }
+
+        // NSS DB must exist before -A; create it silently when the profile
+        // has never been used.
+        if !dir.join("cert9.db").exists() {
+            run(
+                "certutil",
+                &["-N", "-d", &format!("sql:{}", dir.display()), "--empty-password"],
+            )?;
+        }
+
+        run(
+            "certutil",
+            &[
+                "-A",
+                "-d",
+                &format!("sql:{}", dir.display()),
+                "-n",
+                CA_NAME,
+                "-t",
+                "C,,",
+                "-i",
+                der.to_string_lossy().as_ref(),
+            ],
+        )?;
+
+        println!("✓ {CA_NAME} installed into Firefox profile {}", dir.display());
+        installed += 1;
+    }
+
+    if installed == 0 {
+        return Err("no Firefox profile was modified".into());
+    }
+
+    Ok(())
+}
+
+/// Remove the Rexy CA from every Firefox profile (ignore "not found").
+pub fn remove_firefox() -> Result<(), Box<dyn std::error::Error>> {
+    let ini = firefox_profiles_ini()
+        .ok_or("cannot locate the Firefox profiles directory (is Firefox installed?)")?;
+
+    if !ini.exists() {
+        return Err(format!(
+            "Firefox profiles.ini not found at {}",
+            ini.display()
+        )
+        .into());
+    }
+
+    if which_certutil().is_none() {
+        return Err(certutil_hint().into());
+    }
+
+    let ini_dir = ini.parent().expect("profiles.ini has a parent").to_path_buf();
+    let dirs = profile_dirs(&fs::read_to_string(&ini)?, &ini_dir);
+
+    for dir in dirs {
+        // -D fails when the nickname is absent — that is the expected state
+        // for profiles never touched by rexy, so ignore the exit status.
+        let _ = std::process::Command::new("certutil")
+            .args([
+                "-D",
+                "-d",
+                &format!("sql:{}", dir.display()),
+                "-n",
+                CA_NAME,
+            ])
+            .status();
+    }
+
+    println!("✓ {CA_NAME} removed from Firefox profiles");
+
+    Ok(())
+}
+
+fn which_certutil() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("certutil"))
+        .find(|candidate| candidate.is_file())
+}
+
+/// DER bytes of the local CA: certutil -A expects DER, while `ca/rexy.cer`
+/// is PEM — strip the armor and base64-decode.
+fn ca_der() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    use base64::Engine;
+
+    let pem = fs::read_to_string(cert_path())?;
+    let body: String = pem
+        .lines()
+        .filter(|line| !line.contains("-----"))
+        .collect::<Vec<_>>()
+        .join("");
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(body.trim())
+        .map_err(|err| format!("CA certificate is not valid PEM: {err}"))?;
+
+    let tmp = std::env::temp_dir().join(format!("rexy-ca-{}.der", std::process::id()));
+    fs::write(&tmp, decoded)?;
+
+    Ok(tmp)
+}
+
 fn run(program: &str, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
     let status = std::process::Command::new(program).args(args).status()?;
 
@@ -226,3 +442,57 @@ fn run(program: &str, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profiles_ini_paths_are_resolved_and_deduped() {
+        let ini = r#"[Install4F96D1932A9F858E]
+Default=Profiles/xyz.install
+Locked=1
+
+[Profile1]
+Name=default
+IsRelative=1
+Path=Profiles/abc.default
+
+[Profile0]
+Name=default-release
+IsRelative=1
+Path=Profiles/abc.default-release
+
+[Profile2]
+Name=work
+IsRelative=0
+Path=/Users/me/FirefoxProfiles/work
+"#;
+
+        let base = std::path::Path::new("/base");
+        let dirs = profile_dirs(ini, base);
+
+        // Only `Path=` keys count: the `[Install…]` section's `Default=` is
+        // not a profile path entry (the profile has its own [ProfileN]).
+        assert_eq!(
+            dirs,
+            vec![
+                std::path::PathBuf::from("/base/Profiles/abc.default"),
+                std::path::PathBuf::from("/base/Profiles/abc.default-release"),
+                std::path::PathBuf::from("/Users/me/FirefoxProfiles/work"),
+            ]
+        );
+    }
+
+    #[test]
+    fn firefox_prefs_point_at_pac_and_disable_http3() {
+        let user_js = crate::browser::firefox_user_js("http://127.0.0.1:59999/proxy.pac");
+
+        assert!(user_js.contains("user_pref(\"network.proxy.type\", 2);"));
+        assert!(user_js.contains(
+            "user_pref(\"network.proxy.autoconfig_url\", \"http://127.0.0.1:59999/proxy.pac\");"
+        ));
+        assert!(user_js.contains("user_pref(\"network.http.http3.enable\", false);"));
+    }
+}
+
