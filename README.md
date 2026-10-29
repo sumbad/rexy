@@ -158,6 +158,7 @@ rexy run -f rules.toml
 - `--file` cannot be combined with `--host`, `--path`, `--target` or `--csp-override` — those configure a single rule.
 - `--browser`, `--proxy-port` and browser arguments after `--` stay on the command line.
 - The first matching rule wins (host + path prefix).
+- `intercept = false` (default `true`) turns the rule's host into a TLS passthrough: the PAC still routes it through the proxy, but the CONNECT is tunneled **without decryption** — no rewritten certificate, no redirects, only a CONNECT line in the logs (like `--ignore-hosts` in mitmproxy). This is the escape hatch for pinned clients and MITM-unfriendly WAFs; because the traffic is never decrypted, a `target` on such a rule is never used.
 - An empty `rules` list is allowed: rexy logs a warning and runs without redirects.
 
 ### Commands

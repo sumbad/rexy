@@ -42,6 +42,7 @@ pub struct RedirectRule {
     path_prefix: String,
     local_target: String,
     csp_override: Option<CspOverride>,
+    intercept: bool,
 }
 
 impl RedirectRule {
@@ -50,12 +51,14 @@ impl RedirectRule {
         path_prefix: String,
         local_target: String,
         csp_override: Option<CspOverride>,
+        intercept: bool,
     ) -> Self {
         Self {
             prod_host: prod_host.trim_end_matches('.').to_ascii_lowercase(),
             path_prefix: normalize_path_prefix(&path_prefix),
             local_target: local_target.trim_end_matches('/').to_string(),
             csp_override,
+            intercept,
         }
     }
 
@@ -73,6 +76,13 @@ impl RedirectRule {
 
     pub fn csp_override(&self) -> Option<&CspOverride> {
         self.csp_override.as_ref()
+    }
+
+    /// Whether rexy decrypts and can rewrite this host's traffic. With
+    /// `intercept = false` the host is CONNECT-tunneled untouched — the
+    /// escape hatch for pinned clients and MITM-unfriendly WAFs.
+    pub fn intercept(&self) -> bool {
+        self.intercept
     }
 
     fn matches_host(&self, host: &str) -> bool {
@@ -140,11 +150,25 @@ impl DevRedirect {
     }
 
     fn matching_rule(&self, req: &Request<Body>) -> Option<&RedirectRule> {
-        self.rules.iter().find(|rule| rule.matches_request(req))
+        // `intercept = false` rules never rewrite traffic: their host is
+        // tunneled untouched, so a matching request must not be redirected
+        // (plain-HTTP requests reach the handler without a TLS layer).
+        self.rules
+            .iter()
+            .find(|rule| rule.intercept && rule.matches_request(req))
     }
 
     fn matches_any_host(&self, host: &str) -> bool {
         self.rules.iter().any(|rule| rule.matches_host(host))
+    }
+
+    /// TLS interception decision for an SNI host: decrypt only when some rule
+    /// for the host asks to intercept. With no such rule the CONNECT is
+    /// tunneled as-is and only a CONNECT line shows up in the logs.
+    fn should_intercept(&self, server_name: &str) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| rule.intercept && rule.matches_host(server_name))
     }
 }
 
@@ -158,7 +182,16 @@ impl HttpHandler for DevRedirect {
             return false;
         };
 
-        self.matches_any_host(server_name)
+        let intercept = self.should_intercept(server_name);
+
+        if !intercept && self.matches_any_host(server_name) {
+            tracing::info!(
+                host = %server_name,
+                "TLS passthrough: rule sets intercept = false"
+            );
+        }
+
+        intercept
     }
 
     async fn handle_request(
@@ -355,6 +388,7 @@ mod tests {
             "/".into(),
             "http://127.0.0.1:5173".into(),
             csp_override,
+            true,
         )])
     }
 
@@ -383,6 +417,7 @@ mod tests {
             "/".into(),
             "http://127.0.0.1:5173".into(),
             None,
+            true,
         );
         let req = Request::builder()
             .uri("https://example.com/app.js")
@@ -446,6 +481,77 @@ mod tests {
         );
     }
 
+    // ---- per-rule TLS passthrough (intercept = false) ----
+
+    #[test]
+    fn tls_intercepted_only_when_a_rule_asks_for_it() {
+        let h = DevRedirect::new(vec![RedirectRule::new(
+            "example.com".into(),
+            "/".into(),
+            "http://127.0.0.1:5173".into(),
+            None,
+            true,
+        )]);
+
+        assert!(h.should_intercept("example.com"));
+        assert!(!h.should_intercept("other.com"));
+    }
+
+    #[test]
+    fn tls_passthrough_when_rule_sets_intercept_false() {
+        let h = DevRedirect::new(vec![RedirectRule::new(
+            "pinned.example.com".into(),
+            "/".into(),
+            "http://127.0.0.1:5173".into(),
+            None,
+            false,
+        )]);
+
+        assert!(!h.should_intercept("pinned.example.com"));
+        // The host is still known to the PAC (routed via the proxy), it is
+        // only tunneled instead of decrypted.
+        assert!(h.matches_any_host("pinned.example.com"));
+    }
+
+    #[test]
+    fn passthrough_rule_never_rewrites_requests() {
+        let mut h = DevRedirect::new(vec![RedirectRule::new(
+            "pinned.example.com".into(),
+            "/".into(),
+            "http://127.0.0.1:5173".into(),
+            None,
+            false,
+        )]);
+
+        // Plain-HTTP requests to the host reach the handler without a TLS
+        // layer; they must pass through untouched as well.
+        let req = h.handle_request_inner(request_to("pinned.example.com", "/app.js"));
+        assert_eq!(req.uri().to_string(), "https://pinned.example.com/app.js");
+        assert_eq!(req.headers()[header::HOST], "pinned.example.com");
+    }
+
+    #[test]
+    fn one_interceptable_rule_is_enough_to_decrypt_the_host() {
+        let h = DevRedirect::new(vec![
+            RedirectRule::new(
+                "example.com".into(),
+                "/api/".into(),
+                "http://127.0.0.1:1111".into(),
+                None,
+                false,
+            ),
+            RedirectRule::new(
+                "example.com".into(),
+                "/".into(),
+                "http://127.0.0.1:2222".into(),
+                None,
+                true,
+            ),
+        ]);
+
+        assert!(h.should_intercept("example.com"));
+    }
+
     #[test]
     fn non_redirected_state_does_not_leak_into_cloned_handler() {
         // Real hudsucker flow: one handler instance processes the CONNECT
@@ -470,18 +576,21 @@ mod tests {
                 "/app/".into(),
                 "http://127.0.0.1:1111".into(),
                 Some(CspOverride::Policy("policy-a".into())),
+            true,
             ),
             RedirectRule::new(
                 "example.com".into(),
                 "/".into(),
                 "http://127.0.0.1:2222".into(),
                 Some(CspOverride::Policy("policy-b".into())),
+            true,
             ),
             RedirectRule::new(
                 "other.com".into(),
                 "/".into(),
                 "http://127.0.0.1:3333".into(),
                 Some(CspOverride::Off),
+            true,
             ),
         ])
     }
@@ -514,12 +623,14 @@ mod tests {
                 "/".into(),
                 "http://127.0.0.1:1111".into(),
                 None,
+            true,
             ),
             RedirectRule::new(
                 "stripped.com".into(),
                 "/".into(),
                 "http://127.0.0.1:2222".into(),
                 Some(CspOverride::Off),
+            true,
             ),
         ]);
 

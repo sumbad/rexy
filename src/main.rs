@@ -189,6 +189,14 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     info!("proxy listening on http://{proxy_addr}");
 
     for rule in handler.rules() {
+        if !rule.intercept() {
+            info!(
+                "passthrough: https://{}* (intercept = false, CONNECT tunnel only)",
+                rule.host()
+            );
+            continue;
+        }
+
         info!(
             "redirect: https://{}{}* -> {}{}",
             rule.host(),
@@ -284,7 +292,7 @@ fn resolve_rules(args: &RunArgs) -> Result<Vec<RedirectRule>, Box<dyn std::error
     config::validate_path(&path)?;
     config::validate_target(&target)?;
 
-    Ok(vec![RedirectRule::new(host, path, target, csp_override)])
+    Ok(vec![RedirectRule::new(host, path, target, csp_override, true)])
 }
 
 fn init_logging() {
