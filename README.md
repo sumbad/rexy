@@ -145,6 +145,7 @@ host = "app.example.com"
 path = "/"
 target = "https://dev-app.example.internal"
 csp_override = "frame-ancestors *"   # optional; "off" removes the header
+embed = true                         # optional; shed iframe blockers on target responses
 
 [[rules]]
 host = "other.example.com"
@@ -158,6 +159,11 @@ rexy run -f rules.toml
 - `--file` cannot be combined with `--host`, `--path`, `--target` or `--csp-override` — those configure a single rule.
 - `--browser`, `--proxy-port` and browser arguments after `--` stay on the command line.
 - The first matching rule wins (host + path prefix).
+- `embed = true` removes `X-Frame-Options` and the `Cross-Origin-Opener-Policy` /
+  `Cross-Origin-Embedder-Policy` / `Cross-Origin-Resource-Policy` headers from responses served
+  from that rule's target — for embedding the local page in an iframe of a parent shell
+  (the typical iframe scenario is `embed = true` plus `csp_override = "off"`). Passthrough
+  traffic is never modified. Defaults to `false`; single-rule CLI mode has no flag for it.
 - An empty `rules` list is allowed: rexy logs a warning and runs without redirects.
 
 ### Commands

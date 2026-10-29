@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`embed = true` per rule**: removes `X-Frame-Options` and the `Cross-Origin-Opener-Policy` / `Cross-Origin-Embedder-Policy` / `Cross-Origin-Resource-Policy` headers from responses served from that rule's target — `csp_override` alone was not enough to embed the local page in an iframe of a parent shell. Defaults to `false`; passthrough traffic is never modified.
 - **`REXY_PAC_ALL=1` env for `rexy run`**: routes *every* host through the proxy instead of only the intercepted ones (PAC returns `PROXY` unconditionally). Diagnostic-only escape hatch — it defeats the `DIRECT` optimization so traffic the browser would otherwise keep on a direct connection becomes interceptable (e.g. HTTP/2 long-polls). WebRTC/media may break while it is on.
 
 ### Fixed

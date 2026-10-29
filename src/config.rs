@@ -18,6 +18,10 @@ struct FileRule {
     target: String,
     #[serde(default)]
     csp_override: Option<String>,
+    /// Shed embedding blockers (X-Frame-Options, COOP/COEP/CORP) on responses
+    /// from this rule's target — for iframe scenarios.
+    #[serde(default)]
+    embed: bool,
 }
 
 fn default_path() -> String {
@@ -55,6 +59,7 @@ fn rule_from_file(rule: FileRule) -> Result<RedirectRule, Box<dyn std::error::Er
         rule.path,
         rule.target,
         csp_override,
+        rule.embed,
     ))
 }
 
@@ -185,6 +190,29 @@ csp_override = "frame-ancestors *"
             rules[0].csp_override(),
             Some(&CspOverride::Policy("frame-ancestors *".into()))
         );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn embed_defaults_to_false_and_parses_true() {
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "plain.example.com"
+target = "http://127.0.0.1:1111"
+
+[[rules]]
+host = "framed.example.com"
+target = "http://127.0.0.1:2222"
+embed = true
+"#,
+        );
+
+        let rules = load_rules(&path).unwrap();
+
+        assert!(!rules[0].embed());
+        assert!(rules[1].embed());
 
         std::fs::remove_file(&path).ok();
     }

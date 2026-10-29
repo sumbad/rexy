@@ -284,7 +284,7 @@ fn resolve_rules(args: &RunArgs) -> Result<Vec<RedirectRule>, Box<dyn std::error
     config::validate_path(&path)?;
     config::validate_target(&target)?;
 
-    Ok(vec![RedirectRule::new(host, path, target, csp_override)])
+    Ok(vec![RedirectRule::new(host, path, target, csp_override, false)])
 }
 
 fn init_logging() {
