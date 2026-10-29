@@ -36,27 +36,131 @@ pub fn load_rules(path: &Path) -> Result<Vec<RedirectRule>, Box<dyn std::error::
     let parsed: ConfigFile = toml::from_str(&raw)
         .map_err(|err| format!("failed to parse config file {}: {err}", path.display()))?;
 
-    parsed.rules.into_iter().map(rule_from_file).collect()
+    parsed
+        .rules
+        .into_iter()
+        .enumerate()
+        .map(|(index, rule)| rule_from_file(rule, index))
+        .collect()
 }
 
-fn rule_from_file(rule: FileRule) -> Result<RedirectRule, Box<dyn std::error::Error>> {
-    validate_host(&rule.host)?;
-    validate_path(&rule.path)?;
-    validate_target(&rule.target)?;
-
+fn rule_from_file(
+    rule: FileRule,
+    index: usize,
+) -> Result<RedirectRule, Box<dyn std::error::Error>> {
+    let host = interpolate_field(&rule.host, index, "host")?;
+    let path = interpolate_field(&rule.path, index, "path")?;
+    let target = interpolate_field(&rule.target, index, "target")?;
     let csp_override = rule
         .csp_override
         .as_deref()
-        .map(parse_csp_value)
+        .map(|raw| interpolate_field(raw, index, "csp_override"))
         .transpose()?;
 
-    Ok(RedirectRule::new(
-        rule.host,
-        rule.path,
-        rule.target,
-        csp_override,
-    ))
+    validate_host(&host)?;
+    validate_path(&path)?;
+    validate_target(&target)?;
+
+    let csp_override = csp_override.map(|value| parse_csp_value(&value)).transpose()?;
+
+    Ok(RedirectRule::new(host, path, target, csp_override))
 }
+
+/// Expand environment variable references in a rule field, after TOML parsing
+/// (so an expanded value can never break the file's structure).
+///
+/// Supported syntax (bracketed form only, like Docker Compose):
+/// - `${VAR}` — the variable's value; an unset variable without a default is
+///   a load error naming the variable and the rule;
+/// - `${VAR:-default}` — the variable's value, or `default` when unset or
+///   empty-free (an empty value is a value, not an error);
+/// - `$$` — a literal `$`, so `$${VAR}` stays a literal `${VAR}`;
+/// - a bare `$VAR` (no braces) is NOT interpolated — `$` outside `${` is a
+///   literal dollar sign.
+fn interpolate_field(input: &str, rule_index: usize, field: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            out.push(ch);
+            continue;
+        }
+
+        match chars.peek() {
+            Some('$') => {
+                chars.next();
+                out.push('$');
+            }
+            Some('{') => {
+                chars.next();
+
+                let mut expr = String::new();
+                loop {
+                    match chars.next() {
+                        None => {
+                            return Err(format!(
+                                "unterminated ${{…}} — missing '}}' after '${{{expr}"
+                            ));
+                        }
+                        Some('}') => break,
+                        Some(c) => expr.push(c),
+                    }
+                }
+
+                out.push_str(&expand_expr(&expr, rule_index, field)?);
+            }
+            _ => out.push('$'),
+        }
+    }
+
+    Ok(out)
+}
+
+/// Expand one `${…}` expression body: `VAR` or `VAR:-default`.
+fn expand_expr(expr: &str, rule_index: usize, field: &str) -> Result<String, String> {
+    let (name, default) = match expr.split_once(":-") {
+        Some((name, default)) => (name, Some(default)),
+        None => (expr, None),
+    };
+
+    let invalid_name = || {
+        format!(
+            "invalid variable name {:?} in ${{{expr}}} — \
+             expected letters, digits or '_' and a non-empty name",
+            name
+        )
+    };
+
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(invalid_name());
+    }
+
+    match std::env::var(name) {
+        Ok(value) => {
+            if value.is_empty() {
+                // `${VAR:-default}` also covers an empty value (bash `:-`
+                // semantics); an empty value with no default stays empty.
+                match default {
+                    Some(default) => Ok(default.to_string()),
+                    None => Ok(value),
+                }
+            } else {
+                Ok(value)
+            }
+        }
+        Err(std::env::VarError::NotPresent) => match default {
+            Some(default) => Ok(default.to_string()),
+            None => Err(format!(
+                "environment variable {name} is not set (referenced by field {field:?} \
+                 of rule #{}, as ${{{expr}}})",
+                rule_index + 1
+            )),
+        },
+        Err(err @ std::env::VarError::NotUnicode(_)) => Err(err.to_string()),
+    }
+}
+
 
 /// Parse the CSP override value shared by the CLI flag and config entries:
 /// `off` removes the header, any other string replaces it.
@@ -266,5 +370,123 @@ csp_override = "frame-ancestors *\nX-Evil: y"
         );
         assert!(parse_csp_value("   ").is_err());
         assert!(parse_csp_value("x\ny").is_err());
+    }
+
+    // Environment mutation is process-global: every env-dependent scenario
+    // runs inside ONE test so parallel tests cannot race on the variables.
+    #[test]
+    fn interpolation_with_environment() {
+        unsafe {
+            std::env::set_var("REXY_TEST_HOST", "prod.example.com");
+            std::env::set_var("REXY_TEST_PORT", "8123");
+            std::env::set_var("REXY_TEST_EMPTY", "");
+        }
+        let set = |name: &str| unsafe { std::env::remove_var(name) };
+
+        // Present variable expands.
+        assert_eq!(
+            interpolate_field("${REXY_TEST_HOST}/api/", 0, "path").unwrap(),
+            "prod.example.com/api/"
+        );
+
+        // Default used when unset...
+        set("REXY_TEST_UNSET");
+        assert_eq!(
+            interpolate_field("${REXY_TEST_UNSET:-8124}", 0, "path").unwrap(),
+            "8124"
+        );
+        // ...and when set-but-empty (bash `:-` semantics)...
+        assert_eq!(
+            interpolate_field("127.0.0.1:${REXY_TEST_EMPTY:-8124}", 0, "target").unwrap(),
+            "127.0.0.1:8124"
+        );
+        // ...while a present value wins over the default.
+        assert_eq!(
+            interpolate_field("127.0.0.1:${REXY_TEST_PORT:-9999}", 0, "target").unwrap(),
+            "127.0.0.1:8123"
+        );
+
+        // Empty value with no default expands to empty, without an error.
+        assert_eq!(interpolate_field("x${REXY_TEST_EMPTY}y", 0, "path").unwrap(), "xy");
+
+        // Unset without default — error naming the variable, rule and field.
+        let err = interpolate_field("${REXY_TEST_UNSET}", 2, "target").unwrap_err();
+        assert!(err.contains("REXY_TEST_UNSET"), "{err}");
+        assert!(err.contains("#3"), "{err}");
+        assert!(err.contains("target"), "{err}");
+
+        // Bare $VAR is NOT interpolated; $ outside ${...} is literal.
+        assert_eq!(interpolate_field("$REXY_TEST_HOST", 0, "path").unwrap(), "$REXY_TEST_HOST");
+        assert_eq!(interpolate_field("price $5", 0, "path").unwrap(), "price $5");
+        assert_eq!(interpolate_field("trailing $", 0, "path").unwrap(), "trailing $");
+
+        // `$$` escapes a literal `$`; `$${VAR}` stays literal `${VAR}`.
+        assert_eq!(interpolate_field("$$8123", 0, "path").unwrap(), "$8123");
+        assert_eq!(
+            interpolate_field("$${REXY_TEST_HOST}", 0, "path").unwrap(),
+            "${REXY_TEST_HOST}"
+        );
+
+        // Malformed references are errors.
+        assert!(interpolate_field("${REXY_TEST_HOST", 0, "path").is_err()); // unterminated
+        assert!(interpolate_field("${}", 0, "path").is_err()); // empty name
+        assert!(interpolate_field("${1BAD}", 0, "path").is_err()); // bad name chars
+    }
+
+    #[test]
+    fn interpolation_neutral_without_dollar() {
+        // Configs without `${…}` parse exactly as before.
+        assert_eq!(interpolate_field("app.example.com", 0, "host").unwrap(), "app.example.com");
+        assert_eq!(interpolate_field("/api/v1/", 3, "path").unwrap(), "/api/v1/");
+        assert_eq!(interpolate_field("", 0, "csp_override").unwrap(), "");
+    }
+
+    #[test]
+    fn load_rules_expands_environment_in_fields() {
+        unsafe {
+            std::env::set_var("REXY_TEST_RULES_HOST", "a.example.com");
+            std::env::set_var("REXY_TEST_RULES_CSP", "frame-ancestors *");
+        }
+
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "${REXY_TEST_RULES_HOST}"
+target = "http://127.0.0.1:${REXY_TEST_RULES_PORT:-1111}"
+csp_override = "${REXY_TEST_RULES_CSP}"
+"#,
+        );
+
+        let rules = load_rules(&path).unwrap();
+
+        assert_eq!(rules[0].host(), "a.example.com");
+        assert_eq!(rules[0].target(), "http://127.0.0.1:1111");
+        assert_eq!(
+            rules[0].csp_override(),
+            Some(&CspOverride::Policy("frame-ancestors *".into()))
+        );
+
+        unsafe {
+            std::env::remove_var("REXY_TEST_RULES_HOST");
+            std::env::remove_var("REXY_TEST_RULES_CSP");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn load_rules_fails_when_variable_is_unset() {
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "${REXY_TEST_DEFINITELY_UNSET_VAR}"
+target = "http://127.0.0.1:1111"
+"#,
+        );
+
+        let err = load_rules(&path).unwrap_err().to_string();
+        assert!(err.contains("REXY_TEST_DEFINITELY_UNSET_VAR"), "{err}");
+        assert!(err.contains("#1"), "{err}");
+
+        std::fs::remove_file(&path).ok();
     }
 }

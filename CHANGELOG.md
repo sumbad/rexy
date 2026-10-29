@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Environment variables in rules**: `${VAR}` and `${VAR:-default}` interpolate into the string fields (`host`, `path`, `target`, `csp_override`) of a `--file` config — one shared `rules.toml` instead of machine-specific copies. Expansion runs after TOML parsing; `$$` escapes a literal `$`; a bare `$VAR` without braces stays literal; an unset variable without a default fails the load naming the variable, the rule and the field.
 - **`REXY_PAC_ALL=1` env for `rexy run`**: routes *every* host through the proxy instead of only the intercepted ones (PAC returns `PROXY` unconditionally). Diagnostic-only escape hatch — it defeats the `DIRECT` optimization so traffic the browser would otherwise keep on a direct connection becomes interceptable (e.g. HTTP/2 long-polls). WebRTC/media may break while it is on.
 
 ### Fixed

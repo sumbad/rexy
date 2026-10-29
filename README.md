@@ -160,6 +160,30 @@ rexy run -f rules.toml
 - The first matching rule wins (host + path prefix).
 - An empty `rules` list is allowed: rexy logs a warning and runs without redirects.
 
+#### Environment variables in rules
+
+String fields of a rule (`host`, `path`, `target`, `csp_override`) support environment variable
+references, so one shared `rules.toml` can be committed to a repository instead of
+machine-specific copies with hard-coded ports. Expansion happens after TOML parsing — a value
+from the environment can never break the file's structure:
+
+```toml
+[[rules]]
+host = "${APP_HOST}"
+target = "http://127.0.0.1:${OMICRON_PORT:-8124}"
+```
+
+| Syntax             | Meaning                                                                          |
+| ------------------ | -------------------------------------------------------------------------------- |
+| `${VAR}`           | Value of `VAR`; unset variable without a default is a load error                 |
+| `${VAR:-default}`  | Value of `VAR`, or `default` when `VAR` is unset or empty                        |
+| `$$`               | Literal `$` (so `$${VAR}` stays a literal `${VAR}`)                              |
+| `$VAR` (no braces) | Not interpolated — `$` outside `${…}` is a literal dollar sign                   |
+
+- An empty value is a value: `${VAR}` with `VAR=""` expands to an empty string, no error.
+- An unset variable without a default fails the config load with the variable name, the rule number and the field.
+- Single-rule CLI flags (`--host`, `--target`, …) do not interpolate; environment variables work only in `--file` configs.
+
 ### Commands
 
 | Command       | Description                                        |
