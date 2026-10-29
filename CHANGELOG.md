@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Record and replay (`--record <dir>` / `--replay <file>`)**: intercepted exchanges are written to a HAR 1.2 file; a replay answers requests from the recording without the network — offline smoke runs. Matching is by method + URL (exact, then query-free), unmatched requests follow the usual rules; bodies are base64-encoded, headers replayed as-is.
 - **`REXY_PAC_ALL=1` env for `rexy run`**: routes *every* host through the proxy instead of only the intercepted ones (PAC returns `PROXY` unconditionally). Diagnostic-only escape hatch — it defeats the `DIRECT` optimization so traffic the browser would otherwise keep on a direct connection becomes interceptable (e.g. HTTP/2 long-polls). WebRTC/media may break while it is on.
 
 ### Fixed

@@ -1,6 +1,7 @@
 mod browser;
 mod ca;
 mod config;
+mod fixtures;
 mod pac;
 mod proxy_handler;
 mod trust;
@@ -28,7 +29,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Launch the browser through the local proxy.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
 
     /// Install the Rexy Local CA into the OS trust store.
     Trust,
@@ -46,6 +47,15 @@ struct RunArgs {
     /// TOML file with [[rules]] entries; replaces --host/--path/--target/--csp-override.
     #[arg(short, long)]
     file: Option<String>,
+
+    /// Record intercepted exchanges (request/response) into <dir>/rexy-session.har.
+    #[arg(long, value_name = "DIR")]
+    record: Option<String>,
+
+    /// Answer intercepted requests from a recorded HAR session; unmatched
+    /// requests follow the usual rules.
+    #[arg(long, value_name = "HAR_FILE")]
+    replay: Option<String>,
 
     /// Production hostname to intercept (single-rule mode).
     #[arg(long)]
@@ -90,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
 
-        Some(Command::Run(args)) => run(args).await?,
+        Some(Command::Run(args)) => run(*args).await?,
 
         None => {
             println!("Use:");
@@ -157,7 +167,22 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let ca = ca::load_ca()?;
 
-    let handler = DevRedirect::new(rules);
+    let fixtures = resolve_fixtures(&args)?;
+
+    let handler = match fixtures {
+        Fixtures::None => DevRedirect::new(rules),
+        Fixtures::Record(recorder) => {
+            info!(
+                har = %recorder.path().display(),
+                "recording intercepted exchanges"
+            );
+            DevRedirect::with_fixtures(rules, Some(std::sync::Arc::new(recorder)), None)
+        }
+        Fixtures::Replay(replayer) => {
+            info!("replaying from fixtures; unmatched requests follow the rules");
+            DevRedirect::with_fixtures(rules, None, Some(std::sync::Arc::new(replayer)))
+        }
+    };
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -248,6 +273,23 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+enum Fixtures {
+    None,
+    Record(fixtures::Recorder),
+    Replay(fixtures::Replayer),
+}
+
+fn resolve_fixtures(args: &RunArgs) -> Result<Fixtures, Box<dyn std::error::Error>> {
+    match (&args.record, &args.replay) {
+        (Some(_), Some(_)) => {
+            Err("--record and --replay are mutually exclusive: record a session first, then replay it".into())
+        }
+        (Some(dir), None) => Ok(Fixtures::Record(fixtures::Recorder::start(std::path::Path::new(dir))?)),
+        (None, Some(path)) => Ok(Fixtures::Replay(fixtures::Replayer::open(std::path::Path::new(path))?)),
+        (None, None) => Ok(Fixtures::None),
+    }
+}
+
 fn resolve_rules(args: &RunArgs) -> Result<Vec<RedirectRule>, Box<dyn std::error::Error>> {
     if let Some(path) = &args.file {
         if args.host.is_some()
@@ -303,6 +345,8 @@ mod tests {
         RunArgs {
             browser: "chrome".into(),
             file: None,
+            record: None,
+            replay: None,
             host: None,
             path: None,
             target: None,

@@ -1218,11 +1218,14 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "rexy"
 version = "0.2.0"
 dependencies = [
+ "base64",
  "clap",
+ "http-body-util",
  "hudsucker",
  "hyper-rustls",
  "rcgen",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",
