@@ -158,6 +158,7 @@ rexy run -f rules.toml
 - `--file` cannot be combined with `--host`, `--path`, `--target` or `--csp-override` — those configure a single rule.
 - `--browser`, `--proxy-port` and browser arguments after `--` stay on the command line.
 - The first matching rule wins (host + path prefix).
+- Rule order matters: when an earlier rule shadows a later, more specific one (same host, the earlier path prefix covers the later path — including an exact duplicate), rexy logs a warning at startup, because the later rule can never fire. Reorder rules so the more specific path comes first.
 - An empty `rules` list is allowed: rexy logs a warning and runs without redirects.
 
 ### Commands

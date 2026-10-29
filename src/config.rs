@@ -36,7 +36,46 @@ pub fn load_rules(path: &Path) -> Result<Vec<RedirectRule>, Box<dyn std::error::
     let parsed: ConfigFile = toml::from_str(&raw)
         .map_err(|err| format!("failed to parse config file {}: {err}", path.display()))?;
 
-    parsed.rules.into_iter().map(rule_from_file).collect()
+    let rules: Vec<RedirectRule> = parsed
+        .rules
+        .into_iter()
+        .map(rule_from_file)
+        .collect::<Result<_, _>>()?;
+
+    warn_shadowed_rules(&rules);
+
+    Ok(rules)
+}
+
+/// Pairs of rule indices where the earlier rule (first-match-wins) shadows a
+/// later one: same host, and the earlier path prefix covers the later rule's
+/// path — including equal paths (a duplicate host+path). Hosts and paths come
+/// from `RedirectRule` accessors, already normalized exactly like the matcher
+/// normalizes them.
+fn shadowed_pairs(rules: &[RedirectRule]) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+
+    for (later_idx, later) in rules.iter().enumerate() {
+        for (earlier_idx, earlier) in rules.iter().enumerate().take(later_idx) {
+            if earlier.host() == later.host() && later.path().starts_with(earlier.path()) {
+                pairs.push((earlier_idx, later_idx));
+            }
+        }
+    }
+
+    pairs
+}
+
+fn warn_shadowed_rules(rules: &[RedirectRule]) {
+    for (earlier, later) in shadowed_pairs(rules) {
+        tracing::warn!(
+            earlier = format!("#{} {}{}", earlier + 1, rules[earlier].host(), rules[earlier].path()),
+            later = format!("#{} {}{}", later + 1, rules[later].host(), rules[later].path()),
+            "rule is shadowed: the earlier rule matches first (first-match-wins), \
+             so the later rule never fires for these paths — \
+             reorder rules so the more specific path comes first"
+        );
+    }
 }
 
 fn rule_from_file(rule: FileRule) -> Result<RedirectRule, Box<dyn std::error::Error>> {
@@ -266,5 +305,89 @@ csp_override = "frame-ancestors *\nX-Evil: y"
         );
         assert!(parse_csp_value("   ").is_err());
         assert!(parse_csp_value("x\ny").is_err());
+    }
+
+    fn rule(host: &str, path: &str) -> RedirectRule {
+        RedirectRule::new(host.into(), path.into(), "http://127.0.0.1:1111".into(), None)
+    }
+
+    #[test]
+    fn shadowing_is_detected_for_specific_rule_after_generic() {
+        let rules = vec![
+            rule("app.example.com", "/api/"),
+            rule("app.example.com", "/api/v1/omicron/get"),
+        ];
+
+        assert_eq!(shadowed_pairs(&rules), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn shadowing_is_detected_for_duplicate_rules() {
+        let rules = vec![rule("app.example.com", "/api/"), rule("app.example.com", "/api/")];
+
+        assert_eq!(shadowed_pairs(&rules), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn specific_rule_first_is_not_shadowing() {
+        let rules = vec![
+            rule("app.example.com", "/api/v1/omicron/get"),
+            rule("app.example.com", "/api/"),
+        ];
+
+        assert!(shadowed_pairs(&rules).is_empty());
+    }
+
+    #[test]
+    fn different_or_uncomparable_hosts_are_silent() {
+        let rules = vec![
+            rule("app.example.com", "/"),
+            rule("other.example.com", "/"),
+            rule("app.example.com", "/api/"),
+        ];
+
+        // app /  shadows app /api/ ; other /  is a different host — no pair.
+        assert_eq!(shadowed_pairs(&rules), vec![(0, 2)]);
+    }
+
+    #[test]
+    fn prefix_paths_of_same_host_are_comparable() {
+        // "/app" prefix covers "/apple" too — the later rule is unreachable.
+        let rules = vec![rule("app.example.com", "/app"), rule("app.example.com", "/apple")];
+
+        assert_eq!(shadowed_pairs(&rules), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn shorter_but_not_prefix_path_is_silent() {
+        // "/api/" does not cover "/api" (no trailing slash in the later rule).
+        let rules = vec![rule("app.example.com", "/api/"), rule("app.example.com", "/api")];
+
+        assert!(shadowed_pairs(&rules).is_empty());
+    }
+
+    #[test]
+    fn load_rules_logs_without_failing_on_shadowing() {
+        // Shadowing is a warning, not an error: the config still loads.
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "app.example.com"
+path = "/api/"
+target = "http://127.0.0.1:1111"
+
+[[rules]]
+host = "app.example.com"
+path = "/api/v1/omicron/get"
+target = "http://127.0.0.1:8124"
+"#,
+        );
+
+        let rules = load_rules(&path).unwrap();
+
+        assert_eq!(rules.len(), 2);
+        assert_eq!(shadowed_pairs(&rules), vec![(0, 1)]);
+
+        std::fs::remove_file(&path).ok();
     }
 }
