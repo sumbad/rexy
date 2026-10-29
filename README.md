@@ -160,13 +160,34 @@ rexy run -f rules.toml
 - The first matching rule wins (host + path prefix).
 - An empty `rules` list is allowed: rexy logs a warning and runs without redirects.
 
+### Checking which rule matches (offline)
+
+`rexy rules check` evaluates URLs against a rules file using exactly the same matcher as the
+proxy — handy to sanity-check a config from CI or an agent script, without starting a proxy
+or a browser:
+
+```sh
+rexy rules check -f rules.toml https://app.example.com/api/v1/omicron/get https://app.example.com/static/app.js
+```
+
+```text
+match https://app.example.com/api/v1/omicron/get -> rule #1 (path /api/v1/omicron/get) -> http://127.0.0.1:8124
+match https://app.example.com/static/app.js -> rule #2 (path /) -> http://127.0.0.1:8123 (csp: off)
+```
+
+- Rule numbers are 1-based in the text output (`rule #1` = the first rule in the file, matching is first-match-wins).
+- A URL without a scheme is treated as `https://`; the query string is not part of matching (same as in the proxy).
+- No match is a normal result (`miss`, exit code 0); an invalid URL or config file exits with an error.
+- `--json` emits one object per URL, with `rule_index` (zero-based), `rule_host`, `rule_path`, `target` and `csp_override` for matches and just `{"url", "matched": false}` for misses.
+
 ### Commands
 
-| Command       | Description                                        |
-| ------------- | -------------------------------------------------- |
-| `rexy run`    | Launch the browser through the local proxy         |
-| `rexy trust`  | Install the Rexy Local CA into the OS trust store  |
-| `rexy clean`  | Remove the Rexy Local CA from the OS trust store   |
+| Command              | Description                                                       |
+| -------------------- | ----------------------------------------------------------------- |
+| `rexy run`           | Launch the browser through the local proxy                        |
+| `rexy trust`         | Install the Rexy Local CA into the OS trust store                 |
+| `rexy clean`         | Remove the Rexy Local CA from the OS trust store                  |
+| `rexy rules check`   | Print which rule would match each URL (offline, same matcher)     |
 
 ### `run` options
 

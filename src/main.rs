@@ -3,16 +3,18 @@ mod ca;
 mod config;
 mod pac;
 mod proxy_handler;
+mod rules;
 mod trust;
 
 use clap::{Parser, Subcommand};
 use hudsucker::Proxy;
+use rules::{CheckOutcome, RedirectRule};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
 use browser::resolve_browser;
 use hyper_rustls::ConfigBuilderExt;
-use proxy_handler::{DevRedirect, RedirectRule};
+use proxy_handler::DevRedirect;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -35,6 +37,30 @@ enum Command {
 
     /// Remove the Rexy Local CA from the OS trust store.
     Clean,
+
+    /// Work with redirect rules from a TOML file.
+    Rules {
+        #[command(subcommand)]
+        command: RulesCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RulesCommand {
+    /// Print which rule would match each URL — offline, no proxy or browser.
+    Check {
+        /// TOML file with [[rules]] entries.
+        #[arg(short, long)]
+        file: String,
+
+        /// Emit JSON (one object per URL) instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+
+        /// URLs to check; the scheme is optional (https is assumed).
+        #[arg(required = true)]
+        urls: Vec<String>,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -90,14 +116,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
 
-        Some(Command::Run(args)) => run(args).await?,
+    Some(Command::Run(args)) => run(args).await?,
 
-        None => {
-            println!("Use:");
-            println!();
-            println!("  rexy run --file <rules.toml>");
-            println!("  rexy run --host <host> --path <path> --target <url> -- <browser args>");
-            println!();
+    Some(Command::Rules { command }) => match command {
+        RulesCommand::Check { file, json, urls } => rules_check(&file, json, &urls)?,
+    },
+
+    None => {
+        println!("Use:");
+        println!();
+        println!("  rexy run --file <rules.toml>");
+        println!("  rexy run --host <host> --path <path> --target <url> -- <browser args>");
+        println!("  rexy rules check -f <rules.toml> <url>...");
+        println!();
             println!("Example:");
             println!();
             println!("  rexy run \\");
@@ -285,6 +316,55 @@ fn resolve_rules(args: &RunArgs) -> Result<Vec<RedirectRule>, Box<dyn std::error
     config::validate_target(&target)?;
 
     Ok(vec![RedirectRule::new(host, path, target, csp_override)])
+}
+
+/// `rexy rules check -f <rules.toml> <url>...`: offline rule evaluation using
+/// the same matcher as the proxy, for config sanity checks from CI and agent
+/// scripts. Unmatched URLs are a normal result (exit code stays 0); an invalid
+/// URL or config file is an error.
+fn rules_check(
+    file: &str,
+    json: bool,
+    urls: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rules = config::load_rules(std::path::Path::new(file))?;
+
+    let outcomes: Vec<CheckOutcome> = urls
+        .iter()
+        .map(|url| rules::check_url(&rules, url))
+        .collect::<Result<Vec<_>, String>>()?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&outcomes)?);
+    } else {
+        for outcome in &outcomes {
+            print_check_outcome(outcome);
+        }
+    }
+
+    Ok(())
+}
+
+fn print_check_outcome(outcome: &CheckOutcome) {
+    if !outcome.matched {
+        println!("miss  {} -> no matching rule (passthrough)", outcome.url);
+        return;
+    }
+
+    let csp = outcome
+        .csp_override
+        .as_deref()
+        .map(|csp| format!(" (csp: {csp})"))
+        .unwrap_or_default();
+
+    println!(
+        "match {} -> rule #{} (path {}) -> {}{}",
+        outcome.url,
+        outcome.rule_index.expect("matched outcome has a rule index") + 1,
+        outcome.rule_path.as_deref().unwrap_or("/"),
+        outcome.target.as_deref().unwrap_or_default(),
+        csp
+    );
 }
 
 fn init_logging() {

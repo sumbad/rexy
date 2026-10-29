@@ -1,17 +1,8 @@
+use crate::rules::{CspOverride, RedirectRule, local_target_host};
 use hudsucker::{
     Body, HttpContext, HttpHandler, RequestOrResponse,
-    hyper::{HeaderMap, Request, Response, Uri, header},
+    hyper::{HeaderMap, Request, Response, header},
 };
-
-/// How to rewrite the `Content-Security-Policy` header of responses served
-/// from the local target. Parsed from `rexy run --csp-override`.
-#[derive(Clone, Debug, PartialEq)]
-pub enum CspOverride {
-    /// Remove all Content-Security-Policy headers.
-    Off,
-    /// Replace all Content-Security-Policy headers with this policy string.
-    Policy(String),
-}
 
 /// Replace or remove every `Content-Security-Policy` header.
 ///
@@ -31,85 +22,6 @@ fn apply_csp_override(headers: &mut HeaderMap, csp: &CspOverride) {
             // Policy was validated at CLI parse time, so from_str cannot fail
             // here; if it somehow does, leave the headers untouched.
         }
-    }
-}
-
-/// One redirect rule: which host/path prefix to intercept and which local
-/// target to serve it from.
-#[derive(Clone, Debug)]
-pub struct RedirectRule {
-    prod_host: String,
-    path_prefix: String,
-    local_target: String,
-    csp_override: Option<CspOverride>,
-}
-
-impl RedirectRule {
-    pub fn new(
-        prod_host: String,
-        path_prefix: String,
-        local_target: String,
-        csp_override: Option<CspOverride>,
-    ) -> Self {
-        Self {
-            prod_host: prod_host.trim_end_matches('.').to_ascii_lowercase(),
-            path_prefix: normalize_path_prefix(&path_prefix),
-            local_target: local_target.trim_end_matches('/').to_string(),
-            csp_override,
-        }
-    }
-
-    pub fn host(&self) -> &str {
-        &self.prod_host
-    }
-
-    pub fn path(&self) -> &str {
-        &self.path_prefix
-    }
-
-    pub fn target(&self) -> &str {
-        &self.local_target
-    }
-
-    pub fn csp_override(&self) -> Option<&CspOverride> {
-        self.csp_override.as_ref()
-    }
-
-    fn matches_host(&self, host: &str) -> bool {
-        normalize_host(host) == self.prod_host
-    }
-
-    fn matches_request(&self, req: &Request<Body>) -> bool {
-        // HTTP/2 requests carry the authority in the URI (`:authority`), not a
-        // `host` header — fall back to the URI host so those requests still match.
-        let host = req
-            .headers()
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .map(normalize_host)
-            .or_else(|| req.uri().host().map(normalize_host));
-
-        let Some(host) = host else {
-            return false;
-        };
-
-        if host != self.prod_host {
-            return false;
-        }
-
-        req.uri().path().starts_with(&self.path_prefix)
-    }
-
-    fn target_uri(&self, req: &Request<Body>) -> Option<Uri> {
-        let path_and_query = req
-            .uri()
-            .path_and_query()
-            .map(|value| value.as_str())
-            .unwrap_or("/");
-
-        format!("{}{}", self.local_target, path_and_query)
-            .parse::<Uri>()
-            .ok()
     }
 }
 
@@ -139,8 +51,22 @@ impl DevRedirect {
         &self.rules
     }
 
+    /// Host of an intercepted request: the `host` header, falling back to the
+    /// URI host — HTTP/2 requests carry the authority in `:authority`, not a
+    /// `host` header, so without the fallback they would never match.
+    fn request_host(req: &Request<Body>) -> Option<String> {
+        req.headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| req.uri().host().map(str::to_string))
+    }
+
     fn matching_rule(&self, req: &Request<Body>) -> Option<&RedirectRule> {
-        self.rules.iter().find(|rule| rule.matches_request(req))
+        let host = Self::request_host(req)?;
+        let path = req.uri().path();
+
+        self.rules.iter().find(|rule| rule.matches(&host, path))
     }
 
     fn matches_any_host(&self, host: &str) -> bool {
@@ -196,7 +122,14 @@ impl DevRedirect {
 
         let rule = matched?;
 
-        let Some(new_uri) = rule.target_uri(req) else {
+        let path_and_query = req
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/")
+            .to_string();
+
+        let Some(new_uri) = rule.target_uri(&path_and_query) else {
             tracing::error!(
                 uri = ?req.uri(),
                 "failed to construct local target URI"
@@ -205,20 +138,13 @@ impl DevRedirect {
             return None;
         };
 
-        let path_and_query = req
-            .uri()
-            .path_and_query()
-            .map(|value| value.as_str())
-            .unwrap_or("/")
-            .to_string();
-
         *req.uri_mut() = new_uri;
 
-        let host_value = match local_target_host(&rule.local_target) {
+        let host_value = match local_target_host(rule.target()) {
             Some(host) => host,
             None => {
                 tracing::error!(
-                    target = %rule.local_target,
+                    target = %rule.target(),
                     "failed to extract local target host"
                 );
 
@@ -231,13 +157,13 @@ impl DevRedirect {
         }
 
         tracing::info!(
-            host = %rule.prod_host,
+            host = %rule.host(),
             path = %path_and_query,
-            target = %rule.local_target,
+            target = %rule.target(),
             "redirecting request to local dev server"
         );
 
-        rule.csp_override.clone()
+        rule.csp_override().cloned()
     }
 
     fn handle_response_inner(&mut self, mut res: Response<Body>) -> Response<Body> {
@@ -249,36 +175,6 @@ impl DevRedirect {
 
         res
     }
-}
-
-fn normalize_host(host: &str) -> String {
-    host.trim()
-        .trim_end_matches('.')
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase()
-}
-
-fn normalize_path_prefix(path: &str) -> String {
-    let mut value = if path.is_empty() {
-        "/".to_string()
-    } else {
-        path.to_string()
-    };
-
-    if !value.starts_with('/') {
-        value.insert(0, '/');
-    }
-
-    value
-}
-
-fn local_target_host(target: &str) -> Option<String> {
-    let uri: Uri = target.parse().ok()?;
-    let authority = uri.authority()?;
-
-    Some(authority.as_str().to_string())
 }
 
 #[cfg(test)]
@@ -389,7 +285,9 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        assert!(rule.matches_request(&req));
+        let host = DevRedirect::request_host(&req).unwrap();
+
+        assert!(rule.matches(&host, req.uri().path()));
     }
 
     #[test]
