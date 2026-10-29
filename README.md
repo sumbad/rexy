@@ -160,6 +160,25 @@ rexy run -f rules.toml
 - The first matching rule wins (host + path prefix).
 - An empty `rules` list is allowed: rexy logs a warning and runs without redirects.
 
+### Map Local: serve local files instead of a dev server
+
+A rule with a `file:` target serves static files from a directory by the requested path — local
+assets on top of prod without running a dev server. `csp_override` applies to these responses too:
+
+```toml
+[[rules]]
+host = "app.example.com"
+path = "/static/"
+target = "file:/Users/me/build/static"
+csp_override = "off"
+```
+
+- Content-Type is derived from the file extension (html, js, css, json, images, fonts, wasm, …); unknown extensions are served as `application/octet-stream`.
+- Missing files and directories answer `404` — no directory listing. `..` segments and symlink escapes are rejected with `403`. The query string is not part of the lookup.
+- `GET` and `HEAD` are served; other methods answer `405`.
+- Works in `--file` configs and with the single-rule `--target file:<dir>`.
+- Out of scope by design: caching, directory listing, server-side includes.
+
 ### Commands
 
 | Command       | Description                                        |

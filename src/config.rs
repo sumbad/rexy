@@ -107,6 +107,17 @@ pub fn validate_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn validate_target(target: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Map Local: serve static files from a directory instead of a dev server.
+    if let Some(dir) = target.strip_prefix("file:") {
+        if dir.trim().is_empty() {
+            return Err(
+                "file: target must contain a directory path, e.g. file:/path/to/assets".into(),
+            );
+        }
+
+        return Ok(());
+    }
+
     let parsed: hudsucker::hyper::Uri = target.parse()?;
 
     match parsed.scheme_str() {
@@ -186,6 +197,35 @@ csp_override = "frame-ancestors *"
             Some(&CspOverride::Policy("frame-ancestors *".into()))
         );
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn file_target_is_valid_and_requires_a_path() {
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "assets.example.com"
+target = "file:/tmp/rexy-assets"
+"#,
+        );
+
+        let rules = load_rules(&path).unwrap();
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].target(), "file:/tmp/rexy-assets");
+
+        std::fs::remove_file(&path).ok();
+
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "assets.example.com"
+target = "file:"
+"#,
+        );
+
+        assert!(load_rules(&path).is_err());
         std::fs::remove_file(&path).ok();
     }
 
