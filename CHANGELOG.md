@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`rexy rules check -f <rules.toml> <url>...`**: offline rule evaluation — prints which rule matches each URL and where it would go (`--json` for machine-readable output), using the same matcher as the proxy. Matching was extracted into a shared module so the check cannot drift from proxy behavior.
+- **Hot reload of the rules file**: in `--file` mode rexy watches `rules.toml` (mtime/size polling, ~1 s latency) and swaps the rule set without restarting the proxy or the browser; the PAC is regenerated when the host list changes. A broken config logs a warning and keeps the previous rules instead of killing the process.
 - **`REXY_PAC_ALL=1` env for `rexy run`**: routes *every* host through the proxy instead of only the intercepted ones (PAC returns `PROXY` unconditionally). Diagnostic-only escape hatch — it defeats the `DIRECT` optimization so traffic the browser would otherwise keep on a direct connection becomes interceptable (e.g. HTTP/2 long-polls). WebRTC/media may break while it is on.
 
 ### Fixed

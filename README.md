@@ -183,49 +183,19 @@ rexy run -f rules.toml
 - Rule order matters: when an earlier rule shadows a later, more specific one (same host, the earlier path prefix covers the later path — including an exact duplicate), rexy logs a warning at startup, because the later rule can never fire. Reorder rules so the more specific path comes first.
 - An empty `rules` list is allowed: rexy logs a warning and runs without redirects.
 
-#### Environment variables in rules
+### Hot reload of the rules file
 
-String fields of a rule (`host`, `path`, `target`, `csp_override`) support environment variable
-references, so one shared `rules.toml` can be committed to a repository instead of
-machine-specific copies with hard-coded ports. Expansion happens after TOML parsing — a value
-from the environment can never break the file's structure:
+In `--file` mode rexy watches `rules.toml` and applies edits without restarting the proxy or the
+browser — the browser session (logins, profiles) survives. Changes are picked up within about a
+second:
 
-```toml
-[[rules]]
-host = "${APP_HOST}"
-target = "http://127.0.0.1:${OMICRON_PORT:-8124}"
-```
-
-| Syntax             | Meaning                                                                          |
-| ------------------ | -------------------------------------------------------------------------------- |
-| `${VAR}`           | Value of `VAR`; unset variable without a default is a load error                 |
-| `${VAR:-default}`  | Value of `VAR`, or `default` when `VAR` is unset or empty                        |
-| `$$`               | Literal `$` (so `$${VAR}` stays a literal `${VAR}`)                              |
-| `$VAR` (no braces) | Not interpolated — `$` outside `${…}` is a literal dollar sign                   |
-
-- An empty value is a value: `${VAR}` with `VAR=""` expands to an empty string, no error.
-- An unset variable without a default fails the config load with the variable name, the rule number and the field.
-- Single-rule CLI flags (`--host`, `--target`, …) do not interpolate; environment variables work only in `--file` configs.
-
-### Checking which rule matches (offline)
-
-`rexy rules check` evaluates URLs against a rules file using exactly the same matcher as the
-proxy — handy to sanity-check a config from CI or an agent script, without starting a proxy
-or a browser:
-
-```sh
-rexy rules check -f rules.toml https://app.example.com/api/v1/omicron/get https://app.example.com/static/app.js
-```
-
-```text
-match https://app.example.com/api/v1/omicron/get -> rule #1 (path /api/v1/omicron/get) -> http://127.0.0.1:8124
-match https://app.example.com/static/app.js -> rule #2 (path /) -> http://127.0.0.1:8123 (csp: off)
-```
-
-- Rule numbers are 1-based in the text output (`rule #1` = the first rule in the file, matching is first-match-wins).
-- A URL without a scheme is treated as `https://`; the query string is not part of matching (same as in the proxy).
-- No match is a normal result (`miss`, exit code 0); an invalid URL or config file exits with an error.
-- `--json` emits one object per URL, with `rule_index` (zero-based), `rule_host`, `rule_path`, `target` and `csp_override` for matches and just `{"url", "matched": false}` for misses.
+- The rule set is swapped atomically; in-flight requests are unaffected.
+- The PAC script is regenerated when the set of hosts changes. Note: the browser re-fetches the
+  PAC on its own schedule (network-change events), so routes for *new* hosts start working after
+  the next PAC fetch; edits to paths/targets of already-intercepted hosts apply immediately.
+- A broken file (bad TOML, validation error) never kills the proxy: rexy logs a warning and keeps
+  the previous rule set until a valid version is saved.
+- Single-rule mode (`--host/--path/--target`) has no file to watch — restart to change it.
 
 ### Commands
 

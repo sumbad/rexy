@@ -202,13 +202,28 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let pac_hosts: Vec<String> = rules.iter().map(|rule| rule.host().to_string()).collect();
     let route_all = std::env::var("REXY_PAC_ALL").map(|v| v == "1").unwrap_or(false);
     let pac_content = pac::content(&pac_hosts, proxy_addr.port(), route_all);
-    tokio::spawn(pac::serve(pac_listener, pac_content));
+    let shared_pac = std::sync::Arc::new(std::sync::RwLock::new(pac_content));
+    tokio::spawn(pac::serve(pac_listener, std::sync::Arc::clone(&shared_pac)));
 
     let pac_url = format!("http://{pac_addr}/proxy.pac");
 
     let ca = ca::load_ca()?;
 
     let handler = DevRedirect::new(rules);
+
+    // Hot reload: watch the rules file so edits apply without restarting the
+    // proxy or the browser (keeping the browser session alive is the point).
+    if let Some(path) = args.file.as_deref() {
+        // Detached task: lives until the process exits.
+        tokio::spawn(watch_rules_file(
+            std::path::PathBuf::from(path),
+            handler.rules_handle(),
+            std::sync::Arc::clone(&shared_pac),
+            proxy_addr.port(),
+            route_all,
+            std::time::Duration::from_millis(300),
+        ));
+    }
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -392,6 +407,76 @@ fn print_check_outcome(outcome: &CheckOutcome) {
     );
 }
 
+/// Watch the rules file and apply changes without a restart: the rule set is
+/// swapped behind the shared lock, the PAC is regenerated when the host list
+/// changes. A file that fails to load (broken TOML, validation error) keeps
+/// the previous rules — the process never dies from a config edit.
+///
+/// Watching is mtime/size polling (no platform-specific watcher quirks with
+/// editors that save via atomic rename); the poll interval keeps the
+/// apply latency well under a second.
+async fn watch_rules_file(
+    path: std::path::PathBuf,
+    rules: std::sync::Arc<std::sync::RwLock<Vec<rules::RedirectRule>>>,
+    pac_content: std::sync::Arc<std::sync::RwLock<String>>,
+    proxy_port: u16,
+    route_all: bool,
+    interval: std::time::Duration,
+) {
+    let describe = |rules: &[rules::RedirectRule]| -> String {
+        rules
+            .iter()
+            .map(|rule| format!("{}{} -> {}", rule.host(), rule.path(), rule.target()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+
+    let mut signature = file_signature(&path);
+
+    loop {
+        tokio::time::sleep(interval).await;
+
+        let current = file_signature(&path);
+        if current == signature {
+            continue;
+        }
+        signature = current;
+
+        match config::load_rules(&path) {
+            Ok(new_rules) => {
+                let hosts: Vec<String> = new_rules
+                    .iter()
+                    .map(|rule| rule.host().to_string())
+                    .collect();
+
+                *pac_content.write().expect("PAC content lock is poisoned") =
+                    pac::content(&hosts, proxy_port, route_all);
+                *rules.write().expect("rules lock is poisoned") = new_rules;
+
+                info!("rules file reloaded: {}", describe(&rules.read().expect("rules lock is poisoned")));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "failed to reload rules file; keeping the previous rule set"
+                );
+            }
+        }
+    }
+}
+
+/// Cheap change signal for the rules file: editors may save via atomic
+/// rename, so the identity of the file can change — polling mtime+size of the
+/// path catches that as well as in-place writes.
+fn file_signature(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| {
+            let modified = meta.modified().ok()?;
+            Some((modified, meta.len()))
+        })
+}
+
 fn init_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -458,6 +543,107 @@ mod tests {
         args.csp_override = Some("bad\nheader".into());
 
         assert!(resolve_rules(&args).is_err());
+    }
+
+    #[tokio::test]
+    async fn hot_reload_applies_changed_rules_and_regenerates_pac() {
+        let path = std::env::temp_dir().join(format!("rexy-hot-reload-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "[[rules]]\nhost = \"a.example.com\"\ntarget = \"http://127.0.0.1:1111\"\n",
+        )
+        .unwrap();
+
+        let rules = resolve_rules(&file_mode_args(&path)).unwrap();
+        let handler = DevRedirect::new(rules);
+        let rules_handle = handler.rules_handle();
+
+        let pac = std::sync::Arc::new(std::sync::RwLock::new(String::new()));
+        let pac_handle = std::sync::Arc::clone(&pac);
+
+        let watcher = tokio::spawn(watch_rules_file(
+            path.clone(),
+            rules_handle.clone(),
+            pac_handle,
+            8888,
+            false,
+            std::time::Duration::from_millis(20),
+        ));
+
+        // Let the watcher pick up the initial signature first.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        std::fs::write(
+            &path,
+            "[[rules]]\nhost = \"a.example.com\"\ntarget = \"http://127.0.0.1:1111\"\n\n[[rules]]\nhost = \"b.example.com\"\ntarget = \"http://127.0.0.1:2222\"\n",
+        )
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let current = rules_handle.read().unwrap();
+        assert_eq!(current.len(), 2);
+        assert_eq!(current[1].host(), "b.example.com");
+        drop(current);
+
+        // PAC was regenerated with the new host list.
+        let pac_now = pac.read().unwrap().clone();
+        assert!(pac_now.contains("b.example.com"), "{pac_now}");
+        assert!(pac_now.contains("PROXY 127.0.0.1:8888"));
+
+        watcher.abort();
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn hot_reload_keeps_old_rules_on_broken_config() {
+        let path =
+            std::env::temp_dir().join(format!("rexy-hot-broken-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "[[rules]]\nhost = \"a.example.com\"\ntarget = \"http://127.0.0.1:1111\"\n",
+        )
+        .unwrap();
+
+        let rules = resolve_rules(&file_mode_args(&path)).unwrap();
+        let handler = DevRedirect::new(rules);
+        let rules_handle = handler.rules_handle();
+
+        let watcher = tokio::spawn(watch_rules_file(
+            path.clone(),
+            rules_handle.clone(),
+            std::sync::Arc::new(std::sync::RwLock::new(String::new())),
+            8888,
+            false,
+            std::time::Duration::from_millis(20),
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        // Broken TOML: the previous rule set must survive.
+        std::fs::write(&path, "[[rules]]\nhost = ").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(rules_handle.read().unwrap().len(), 1);
+
+        // A later valid edit still applies (the watcher did not die).
+        std::fs::write(
+            &path,
+            "[[rules]]\nhost = \"c.example.com\"\ntarget = \"http://127.0.0.1:3333\"\n",
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let current = rules_handle.read().unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].host(), "c.example.com");
+
+        watcher.abort();
+        std::fs::remove_file(&path).ok();
+    }
+
+    fn file_mode_args(path: &std::path::Path) -> RunArgs {
+        let mut args = base_args();
+        args.file = Some(path.to_string_lossy().into_owned());
+        args
     }
 
     #[test]
