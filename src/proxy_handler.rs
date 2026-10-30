@@ -25,6 +25,44 @@ fn apply_csp_override(headers: &mut HeaderMap, csp: &CspOverride) {
     }
 }
 
+/// Remove the headers that stop a page from being embedded in an iframe of a
+/// parent shell. Used when the matched rule sets `embed = true`; only
+/// responses served from that rule's target are affected — passthrough
+/// traffic keeps its headers. CSP handling is separate (`csp_override`), so
+/// the typical iframe scenario is `embed = true` plus `csp_override = "off"`.
+fn strip_embed_blockers(headers: &mut HeaderMap) {
+    // hyper's `header` module has no constants for the cross-origin policies.
+    let blockers = [
+        header::X_FRAME_OPTIONS,
+        header::HeaderName::from_static("cross-origin-opener-policy"),
+        header::HeaderName::from_static("cross-origin-embedder-policy"),
+        header::HeaderName::from_static("cross-origin-resource-policy"),
+    ];
+
+    for name in blockers {
+        if headers.remove(&name).is_some() {
+            tracing::debug!(%name, "removed embed blocker from target response");
+        }
+    }
+}
+
+/// What to do to the response of the current request: CSP override from the
+/// matched rule plus whether the rule asked to shed embedding blockers.
+#[derive(Clone, Debug, Default)]
+struct ResponseEdits {
+    csp_override: Option<CspOverride>,
+    embed: bool,
+}
+
+impl ResponseEdits {
+    fn from_rule(rule: &RedirectRule) -> Self {
+        Self {
+            csp_override: rule.csp_override().cloned(),
+            embed: rule.embed(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DevRedirect {
     /// Current rule set, shared with the hot-reload watcher: the watcher
@@ -38,14 +76,14 @@ pub struct DevRedirect {
     /// phase into every clone (clones are made from the instance that already
     /// processed CONNECT). Overwriting the field in `handle_request` makes
     /// inherited values irrelevant.
-    pending_csp: Option<CspOverride>,
+    pending_edits: ResponseEdits,
 }
 
 impl DevRedirect {
     pub fn new(rules: Vec<RedirectRule>) -> Self {
         Self {
             rules: std::sync::Arc::new(std::sync::RwLock::new(rules)),
-            pending_csp: None,
+            pending_edits: ResponseEdits::default(),
         }
     }
 
@@ -144,14 +182,14 @@ impl HttpHandler for DevRedirect {
 
 impl DevRedirect {
     fn handle_request_inner(&mut self, mut req: Request<Body>) -> Request<Body> {
-        let pending_csp = self.rewrite_request(&mut req);
+        let edits = self.rewrite_request(&mut req);
 
-        self.pending_csp = pending_csp;
+        self.pending_edits = edits;
 
         req
     }
 
-    fn rewrite_request(&self, req: &mut Request<Body>) -> Option<CspOverride> {
+    fn rewrite_request(&self, req: &mut Request<Body>) -> ResponseEdits {
         let matched = self.matching_rule(req);
 
         tracing::info!(
@@ -162,7 +200,9 @@ impl DevRedirect {
             "HTTP request"
         );
 
-        let rule = matched?;
+        let Some(rule) = matched else {
+            return ResponseEdits::default();
+        };
 
         let path_and_query = req
             .uri()
@@ -177,7 +217,7 @@ impl DevRedirect {
                 "failed to construct local target URI"
             );
 
-            return None;
+            return ResponseEdits::default();
         };
 
         *req.uri_mut() = new_uri;
@@ -190,7 +230,7 @@ impl DevRedirect {
                     "failed to extract local target host"
                 );
 
-                return None;
+                return ResponseEdits::default();
             }
         };
 
@@ -205,14 +245,20 @@ impl DevRedirect {
             "redirecting request to local dev server"
         );
 
-        rule.csp_override().cloned()
+        ResponseEdits::from_rule(&rule)
     }
 
     fn handle_response_inner(&mut self, mut res: Response<Body>) -> Response<Body> {
-        if let Some(csp_override) = self.pending_csp.take() {
-            apply_csp_override(res.headers_mut(), &csp_override);
+        let edits = std::mem::take(&mut self.pending_edits);
+
+        if let Some(csp_override) = &edits.csp_override {
+            apply_csp_override(res.headers_mut(), csp_override);
 
             tracing::info!(?csp_override, "csp override applied to redirected response");
+        }
+
+        if edits.embed {
+            strip_embed_blockers(res.headers_mut());
         }
 
         res
@@ -294,6 +340,18 @@ mod tests {
             "http://127.0.0.1:5173".into(),
             csp_override,
             true,
+            false,
+        )])
+    }
+
+    fn embed_handler() -> DevRedirect {
+        DevRedirect::new(vec![RedirectRule::new(
+            "example.com".into(),
+            "/".into(),
+            "http://127.0.0.1:5173".into(),
+            None,
+            true,
+            true,
         )])
     }
 
@@ -323,6 +381,7 @@ mod tests {
             "http://127.0.0.1:5173".into(),
             None,
             true,
+            false,
         );
         let req = Request::builder()
             .uri("https://example.com/app.js")
@@ -390,6 +449,110 @@ mod tests {
 
     // ---- per-rule TLS passthrough (intercept = false) ----
 
+    // ---- embed: shed iframe blockers on target responses ----
+
+    #[test]
+    fn embed_sheds_all_blockers_on_target_response() {
+        let mut h = embed_handler();
+
+        let req = request_to("example.com", "/app.js");
+        let _ = h.handle_request_inner(req);
+
+        let mut res = Response::new(Body::empty());
+        for (name, value) in [
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (
+                header::HeaderName::from_static("cross-origin-opener-policy"),
+                "same-origin",
+            ),
+            (
+                header::HeaderName::from_static("cross-origin-embedder-policy"),
+                "require-corp",
+            ),
+            (
+                header::HeaderName::from_static("cross-origin-resource-policy"),
+                "same-origin",
+            ),
+        ] {
+            res.headers_mut()
+                .insert(name, header::HeaderValue::from_static(value));
+        }
+        res.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'".parse().unwrap(),
+        );
+
+        let res = h.handle_response_inner(res);
+
+        assert!(!res.headers().contains_key(header::X_FRAME_OPTIONS));
+        assert!(!res.headers().contains_key("cross-origin-opener-policy"));
+        assert!(!res.headers().contains_key("cross-origin-embedder-policy"));
+        assert!(!res.headers().contains_key("cross-origin-resource-policy"));
+        // CSP is a separate concern: without csp_override it survives.
+        assert!(res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+    }
+
+    #[test]
+    fn embed_false_keeps_blockers_on_target_response() {
+        let mut h = handler(None);
+
+        let req = request_to("example.com", "/app.js");
+        let _ = h.handle_request_inner(req);
+
+        let mut res = Response::new(Body::empty());
+        res.headers_mut()
+            .insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));
+
+        let res = h.handle_response_inner(res);
+
+        assert_eq!(res.headers()[header::X_FRAME_OPTIONS], "DENY");
+    }
+
+    #[test]
+    fn embed_does_not_touch_passthrough_responses() {
+        let mut h = embed_handler();
+
+        let req = request_to("other.com", "/app.js");
+        let _ = h.handle_request_inner(req);
+
+        let mut res = Response::new(Body::empty());
+        res.headers_mut()
+            .insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));
+
+        let res = h.handle_response_inner(res);
+
+        assert_eq!(res.headers()[header::X_FRAME_OPTIONS], "DENY");
+    }
+
+    #[test]
+    fn embed_and_csp_override_apply_together() {
+        // The typical iframe scenario: embed = true + csp_override = "off".
+        let mut h = DevRedirect::new(vec![RedirectRule::new(
+            "example.com".into(),
+            "/".into(),
+            "http://127.0.0.1:5173".into(),
+            Some(CspOverride::Off),
+            true,
+            true,
+        )]);
+
+        let req = request_to("example.com", "/app.js");
+        let _ = h.handle_request_inner(req);
+
+        let mut res = Response::new(Body::empty());
+        res.headers_mut()
+            .insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));
+        res.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'".parse().unwrap(),
+        );
+
+        let res = h.handle_response_inner(res);
+
+        assert!(!res.headers().contains_key(header::X_FRAME_OPTIONS));
+        assert!(!res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+    }
+
     #[test]
     fn tls_intercepted_only_when_a_rule_asks_for_it() {
         let h = DevRedirect::new(vec![RedirectRule::new(
@@ -398,6 +561,7 @@ mod tests {
             "http://127.0.0.1:5173".into(),
             None,
             true,
+            false,
         )]);
 
         assert!(h.should_intercept("example.com"));
@@ -411,6 +575,7 @@ mod tests {
             "/".into(),
             "http://127.0.0.1:5173".into(),
             None,
+            false,
             false,
         )]);
 
@@ -427,6 +592,7 @@ mod tests {
             "/".into(),
             "http://127.0.0.1:5173".into(),
             None,
+            false,
             false,
         )]);
 
@@ -446,6 +612,7 @@ mod tests {
                 "http://127.0.0.1:1111".into(),
                 None,
                 false,
+                false,
             ),
             RedirectRule::new(
                 "example.com".into(),
@@ -453,6 +620,7 @@ mod tests {
                 "http://127.0.0.1:2222".into(),
                 None,
                 true,
+                false,
             ),
         ]);
 
@@ -484,6 +652,7 @@ mod tests {
                 "http://127.0.0.1:1111".into(),
                 Some(CspOverride::Policy("policy-a".into())),
             true,
+                false,
             ),
             RedirectRule::new(
                 "example.com".into(),
@@ -491,6 +660,7 @@ mod tests {
                 "http://127.0.0.1:2222".into(),
                 Some(CspOverride::Policy("policy-b".into())),
             true,
+                false,
             ),
             RedirectRule::new(
                 "other.com".into(),
@@ -498,6 +668,7 @@ mod tests {
                 "http://127.0.0.1:3333".into(),
                 Some(CspOverride::Off),
             true,
+                false,
             ),
         ])
     }
@@ -531,6 +702,7 @@ mod tests {
                 "http://127.0.0.1:1111".into(),
                 None,
             true,
+                false,
             ),
             RedirectRule::new(
                 "stripped.com".into(),
@@ -538,6 +710,7 @@ mod tests {
                 "http://127.0.0.1:2222".into(),
                 Some(CspOverride::Off),
             true,
+                false,
             ),
         ]);
 

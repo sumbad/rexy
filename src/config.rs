@@ -22,6 +22,10 @@ struct FileRule {
     /// clients and MITM-unfriendly WAFs). Default: intercept.
     #[serde(default = "default_true")]
     intercept: bool,
+    /// Shed embedding blockers (X-Frame-Options, COOP/COEP/CORP) on responses
+    /// from this rule's target — for iframe scenarios.
+    #[serde(default)]
+    embed: bool,
 }
 
 fn default_true() -> bool {
@@ -112,6 +116,7 @@ fn rule_from_file(
         target,
         csp_override,
         rule.intercept,
+        rule.embed,
     ))
 }
 
@@ -366,6 +371,29 @@ intercept = false
     }
 
     #[test]
+    fn embed_defaults_to_false_and_parses_true() {
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "plain.example.com"
+target = "http://127.0.0.1:1111"
+
+[[rules]]
+host = "framed.example.com"
+target = "http://127.0.0.1:2222"
+embed = true
+"#,
+        );
+
+        let rules = load_rules(&path).unwrap();
+
+        assert!(!rules[0].embed());
+        assert!(rules[1].embed());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn empty_rules_list_is_ok() {
         let path = write_temp_config("rules = []\n");
         assert_eq!(load_rules(&path).unwrap().len(), 0);
@@ -445,7 +473,7 @@ csp_override = "frame-ancestors *\nX-Evil: y"
     }
 
     fn rule(host: &str, path: &str) -> RedirectRule {
-        RedirectRule::new(host.into(), path.into(), "http://127.0.0.1:1111".into(), None, true)
+        RedirectRule::new(host.into(), path.into(), "http://127.0.0.1:1111".into(), None, true, false)
     }
 
     #[test]

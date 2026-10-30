@@ -363,7 +363,7 @@ fn resolve_rules(args: &RunArgs) -> Result<Vec<RedirectRule>, Box<dyn std::error
     config::validate_path(&path)?;
     config::validate_target(&target)?;
 
-    Ok(vec![RedirectRule::new(host, path, target, csp_override, true)])
+    Ok(vec![RedirectRule::new(host, path, target, csp_override, true, false)])
 }
 
 /// `rexy rules check -f <rules.toml> <url>...`: offline rule evaluation using

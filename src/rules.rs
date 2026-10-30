@@ -20,6 +20,7 @@ pub struct RedirectRule {
     local_target: String,
     csp_override: Option<CspOverride>,
     intercept: bool,
+    embed: bool,
 }
 
 impl RedirectRule {
@@ -29,6 +30,7 @@ impl RedirectRule {
         local_target: String,
         csp_override: Option<CspOverride>,
         intercept: bool,
+        embed: bool,
     ) -> Self {
         Self {
             prod_host: normalize_host(&prod_host),
@@ -36,6 +38,7 @@ impl RedirectRule {
             local_target: local_target.trim_end_matches('/').to_string(),
             csp_override,
             intercept,
+            embed,
         }
     }
 
@@ -60,6 +63,13 @@ impl RedirectRule {
     /// escape hatch for pinned clients and MITM-unfriendly WAFs.
     pub fn intercept(&self) -> bool {
         self.intercept
+    }
+
+    /// Whether responses from this rule's target shed embedding blockers
+    /// (`X-Frame-Options`, COOP/COEP/CORP) so the page can live in an iframe
+    /// of a parent shell.
+    pub fn embed(&self) -> bool {
+        self.embed
     }
 
     /// Shared matcher: exact host (normalized) plus path-prefix match.
@@ -197,7 +207,7 @@ mod tests {
     use super::*;
 
     fn rule(host: &str, path: &str, target: &str) -> RedirectRule {
-        RedirectRule::new(host.into(), path.into(), target.into(), None, true)
+        RedirectRule::new(host.into(), path.into(), target.into(), None, true, false)
     }
 
     #[test]
