@@ -229,6 +229,8 @@ csp_override = "off"
 | `--target <url>`           | —          | Local development server (`http://` or `https://`)                 |
 | `--proxy-port <port>`      | `0`        | Local proxy port; `0` picks a free port                            |
 | `--csp-override <policy\|off>` | —      | Replace all `Content-Security-Policy` headers of responses served from `--target` (`off` removes them); passthrough traffic is untouched |
+| `--record <dir>`           | —          | Write intercepted exchanges into `<dir>/rexy-session.har` (HAR 1.2) |
+| `--replay <file>`          | —          | Answer requests from a recorded HAR session; unmatched follow the rules |
 | `-- <args>`                | —          | Extra arguments passed to the browser                              |
 
 ### Rules status page
@@ -245,6 +247,30 @@ silently" class of problems becomes visible at a glance.
 
 If the port is busy, rexy logs a warning and runs without the page — the proxy itself is
 unaffected.
+### Record and replay (offline smoke runs)
+
+`--record <dir>` writes every intercepted exchange into `<dir>/rexy-session.har` (HAR 1.2 — the
+file opens in Chrome DevTools or mitmproxy); `--replay <file>` answers requests from a recorded
+session without touching the network. The two flags are mutually exclusive.
+
+```sh
+# run the smoke once, against prod/local targets, recording everything
+rexy run --record /tmp/smoke-1 -f rules.toml --browser chromium
+
+# later: the same smoke fully offline — responses come from the fixtures
+rexy run --replay /tmp/smoke-1/rexy-session.har -f rules.toml --browser chromium
+```
+
+- Replay matches by method + URL: the exact URL first, then the URL without the query string —
+  cache-busting parameters do not break the replay. Unmatched requests follow the usual rules
+  (redirect targets or passthrough).
+- Bodies are stored base64-encoded, so binary responses survive; recorded response headers —
+  cookies included — are replayed as-is.
+- Recording buffers response bodies, so streaming responses (SSE, long-poll) are not suitable
+  for recording.
+- Recording covers every request that reaches the proxy on intercepted hosts — redirected to a
+  target or passing through within those hosts. Traffic rexy never sees (PAC `DIRECT`) is not
+  recorded, so offline replay works for the intercepted hosts, not for the whole browser session.
 
 ### Logging
 

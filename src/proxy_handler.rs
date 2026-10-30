@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::fixtures::{HarHeader, Recorder, Replayer};
 use crate::rules::{CspOverride, RedirectRule, local_target_host};
 use crate::status::{Decision, EventLog, now_ms};
 use hudsucker::{
@@ -26,6 +27,39 @@ fn apply_csp_override(headers: &mut HeaderMap, csp: &CspOverride) {
             // here; if it somehow does, leave the headers untouched.
         }
     }
+}
+
+/// The original prod URL of a request, as seen before any rewrite: absolute
+/// URIs (plain-HTTP proxy requests) keep their scheme; requests on decrypted
+/// TLS connections without a scheme in the URI are composed as `https://`.
+/// Both recording and replaying use this, so the keys always match.
+fn original_url(req: &Request<Body>) -> String {
+    let uri = req.uri();
+
+    if uri.scheme_str().is_some() && uri.host().is_some() {
+        return uri.to_string();
+    }
+
+    let host = DevRedirect::request_host(req).unwrap_or_default();
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+
+    format!("https://{host}{path_and_query}")
+}
+
+fn headers_to_har(headers: &HeaderMap) -> Vec<HarHeader> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let value = value.to_str().ok()?;
+            Some(HarHeader {
+                name: name.as_str().to_string(),
+                value: value.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Remove the headers that stop a page from being embedded in an iframe of a
@@ -82,6 +116,15 @@ struct Pending {
     edits: ResponseEdits,
 }
 
+/// Per-request metadata for the recording phase: the original prod URL and
+/// request headers, captured before any rewrite.
+#[derive(Clone, Debug)]
+struct RecordMeta {
+    url: String,
+    headers: Vec<HarHeader>,
+    started_ms: u128,
+}
+
 #[derive(Clone, Debug)]
 pub struct DevRedirect {
     /// Current rule set, shared with the hot-reload watcher: the watcher
@@ -89,7 +132,13 @@ pub struct DevRedirect {
     rules: std::sync::Arc<std::sync::RwLock<Vec<RedirectRule>>>,
     /// Shared status event log: the status page server reads what we record.
     events: Arc<EventLog>,
+    /// `--record <dir>`: write intercepted exchanges into a HAR file.
+    recorder: Option<Arc<Recorder>>,
+    /// `--replay <file>`: answer requests from a recorded session before the
+    /// rules get a chance.
+    replayer: Option<Arc<Replayer>>,
     pending: Option<Pending>,
+    pending_record: Option<RecordMeta>,
 }
 
 impl DevRedirect {
@@ -101,7 +150,25 @@ impl DevRedirect {
         Self {
             rules: std::sync::Arc::new(std::sync::RwLock::new(rules)),
             events,
+            recorder: None,
+            replayer: None,
             pending: None,
+            pending_record: None,
+        }
+    }
+
+    pub fn with_fixtures(
+        rules: Vec<RedirectRule>,
+        recorder: Option<Arc<Recorder>>,
+        replayer: Option<Arc<Replayer>>,
+    ) -> Self {
+        Self {
+            rules: std::sync::Arc::new(std::sync::RwLock::new(rules)),
+            events: EventLog::new(),
+            recorder,
+            replayer,
+            pending: None,
+            pending_record: None,
         }
     }
 
@@ -112,6 +179,54 @@ impl DevRedirect {
     /// The shared event log handle for the status page server.
     pub fn events_handle(&self) -> Arc<EventLog> {
         Arc::clone(&self.events)
+    }
+
+    /// Replay from fixtures has priority over the rules: an offline smoke
+    /// must not touch the network. The original prod URL is the key.
+    fn replay_response(&self, req: &Request<Body>) -> Option<Response<Body>> {
+        use base64::Engine;
+
+        let replayer = self.replayer.as_ref()?;
+        let url = original_url(req);
+
+        let recorded = replayer.lookup(req.method().as_str(), &url)?;
+
+        let mut builder = Response::builder().status(recorded.status);
+        for header in &recorded.headers {
+            if let (Ok(name), Ok(value)) = (
+                header.name.parse::<header::HeaderName>(),
+                header::HeaderValue::from_str(&header.value),
+            ) {
+                builder = builder.header(name, value);
+            }
+        }
+
+        let body = if recorded.content.encoding.as_deref() == Some("base64") {
+            base64::engine::general_purpose::STANDARD
+                .decode(&recorded.content.text)
+                .unwrap_or_default()
+        } else {
+            recorded.content.text.clone().into_bytes()
+        };
+
+        tracing::info!(%url, status = recorded.status, "replaying response from fixtures");
+
+        Some(
+            builder
+                .body(Body::from(body))
+                .expect("fixture response with valid status builds"),
+        )
+    }
+
+    fn record_meta(req: &Request<Body>) -> Option<RecordMeta> {
+        Some(RecordMeta {
+            url: original_url(req),
+            headers: headers_to_har(req.headers()),
+            started_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+        })
     }
 
     /// Host of an intercepted request: the `host` header, falling back to the
@@ -233,12 +348,21 @@ impl HttpHandler for DevRedirect {
     }
 
     async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
-        self.handle_response_inner(res)
+        self.handle_response_inner(res).await
     }
 }
 
 impl DevRedirect {
     fn handle_request_inner(&mut self, mut req: Request<Body>) -> RequestOrResponse {
+        if let Some(response) = self.replay_response(&req) {
+            return RequestOrResponse::Response(response);
+        }
+
+        self.pending_record = self
+            .recorder
+            .as_ref()
+            .and_then(|_| Self::record_meta(&req));
+
         let matched = self.matching_rule_index(&req);
 
         tracing::info!(
@@ -276,6 +400,8 @@ impl DevRedirect {
                 started_ms,
                 edits: ResponseEdits::default(),
             });
+            // Missed requests go to prod unchanged; recording covers
+            // intercepted hosts' traffic regardless, keep the meta.
 
             return RequestOrResponse::Request(req);
         };
@@ -372,7 +498,7 @@ impl DevRedirect {
         ResponseEdits::from_rule(rule)
     }
 
-    fn handle_response_inner(&mut self, mut res: Response<Body>) -> Response<Body> {
+    async fn handle_response_inner(&mut self, mut res: Response<Body>) -> Response<Body> {
         if let Some(pending) = self.pending.take() {
             if let Some(csp_override) = &pending.edits.csp_override {
                 apply_csp_override(res.headers_mut(), csp_override);
@@ -391,7 +517,50 @@ impl DevRedirect {
             );
         }
 
+        // Recording needs the whole body, which means buffering: streaming
+        // responses (SSE, long-poll) are not suitable for recording anyway.
+        if let (Some(meta), Some(recorder)) =
+            (self.pending_record.take(), self.recorder.clone())
+        {
+            return self.buffer_and_record(recorder, meta, res).await;
+        }
+
         res
+    }
+
+    async fn buffer_and_record(
+        &self,
+        recorder: Arc<Recorder>,
+        meta: RecordMeta,
+        res: Response<Body>,
+    ) -> Response<Body> {
+        use http_body_util::BodyExt;
+
+        let (parts, body) = res.into_parts();
+        let bytes = match body.collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(err) => {
+                tracing::warn!(%err, url = %meta.url, "failed to buffer response for recording");
+                return Response::from_parts(parts, Body::empty());
+            }
+        };
+
+        recorder.record(
+            "GET",
+            &meta.url,
+            meta.headers,
+            parts.status.as_u16(),
+            headers_to_har(&parts.headers),
+            &bytes,
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+                - meta.started_ms as i64)
+                .max(0),
+        );
+
+        Response::from_parts(parts, Body::from(bytes.to_vec()))
     }
 }
 
@@ -661,26 +830,30 @@ mod tests {
         assert!(rule.matches(&host, req.uri().path()));
     }
 
-    #[test]
-    fn response_for_redirected_request_gets_override() {
+    #[tokio::test]
+    async fn response_for_redirected_request_gets_override() {
         let mut h = handler(Some(CspOverride::Off));
 
         let req = request_to("example.com", "/app.js");
         let _ = h.handle_request_inner(req);
 
-        let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+        let res = h
+            .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
+            .await;
 
         assert!(!res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
     }
 
-    #[test]
-    fn response_for_passthrough_request_is_untouched() {
+    #[tokio::test]
+    async fn response_for_passthrough_request_is_untouched() {
         let mut h = handler(Some(CspOverride::Off));
 
         let req = request_to("other.com", "/app.js");
         let _ = h.handle_request_inner(req);
 
-        let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+        let res = h
+            .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
+            .await;
 
         assert_eq!(
             res.headers()[header::CONTENT_SECURITY_POLICY],
@@ -688,14 +861,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn response_without_override_keeps_csp() {
+    #[tokio::test]
+    async fn response_without_override_keeps_csp() {
         let mut h = handler(None);
 
         let req = request_to("example.com", "/app.js");
         let _ = h.handle_request_inner(req);
 
-        let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+        let res = h
+            .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
+            .await;
 
         assert_eq!(
             res.headers()[header::CONTENT_SECURITY_POLICY],
@@ -703,11 +878,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn response_without_prior_request_is_untouched() {
+    #[tokio::test]
+    async fn response_without_prior_request_is_untouched() {
         let mut h = handler(Some(CspOverride::Off));
 
-        let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+        let res = h
+            .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
+            .await;
 
         assert_eq!(
             res.headers()[header::CONTENT_SECURITY_POLICY],
@@ -719,8 +896,8 @@ mod tests {
 
     // ---- embed: shed iframe blockers on target responses ----
 
-    #[test]
-    fn embed_sheds_all_blockers_on_target_response() {
+    #[tokio::test]
+    async fn embed_sheds_all_blockers_on_target_response() {
         let mut h = embed_handler();
 
         let req = request_to("example.com", "/app.js");
@@ -750,7 +927,7 @@ mod tests {
             "default-src 'none'".parse().unwrap(),
         );
 
-        let res = h.handle_response_inner(res);
+        let res = h.handle_response_inner(res).await;
 
         assert!(!res.headers().contains_key(header::X_FRAME_OPTIONS));
         assert!(!res.headers().contains_key("cross-origin-opener-policy"));
@@ -760,8 +937,8 @@ mod tests {
         assert!(res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
     }
 
-    #[test]
-    fn embed_false_keeps_blockers_on_target_response() {
+    #[tokio::test]
+    async fn embed_false_keeps_blockers_on_target_response() {
         let mut h = handler(None);
 
         let req = request_to("example.com", "/app.js");
@@ -771,13 +948,13 @@ mod tests {
         res.headers_mut()
             .insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));
 
-        let res = h.handle_response_inner(res);
+        let res = h.handle_response_inner(res).await;
 
         assert_eq!(res.headers()[header::X_FRAME_OPTIONS], "DENY");
     }
 
-    #[test]
-    fn embed_does_not_touch_passthrough_responses() {
+    #[tokio::test]
+    async fn embed_does_not_touch_passthrough_responses() {
         let mut h = embed_handler();
 
         let req = request_to("other.com", "/app.js");
@@ -787,13 +964,13 @@ mod tests {
         res.headers_mut()
             .insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));
 
-        let res = h.handle_response_inner(res);
+        let res = h.handle_response_inner(res).await;
 
         assert_eq!(res.headers()[header::X_FRAME_OPTIONS], "DENY");
     }
 
-    #[test]
-    fn embed_and_csp_override_apply_together() {
+    #[tokio::test]
+    async fn embed_and_csp_override_apply_together() {
         // The typical iframe scenario: embed = true + csp_override = "off".
         let mut h = DevRedirect::new(vec![RedirectRule::new(
             "example.com".into(),
@@ -815,7 +992,7 @@ mod tests {
             "default-src 'none'".parse().unwrap(),
         );
 
-        let res = h.handle_response_inner(res);
+        let res = h.handle_response_inner(res).await;
 
         assert!(!res.headers().contains_key(header::X_FRAME_OPTIONS));
         assert!(!res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
@@ -899,8 +1076,8 @@ mod tests {
         assert!(h.should_intercept("example.com"));
     }
 
-    #[test]
-    fn non_redirected_state_does_not_leak_into_cloned_handler() {
+    #[tokio::test]
+    async fn non_redirected_state_does_not_leak_into_cloned_handler() {
         // Real hudsucker flow: one handler instance processes the CONNECT
         // request (no redirect), then `serve_stream` clones that instance for
         // every decrypted inner request. The clone must not inherit the
@@ -911,7 +1088,9 @@ mod tests {
         let mut inner = connect_handler.clone();
         let _ = inner.handle_request_inner(request_to("example.com", "/"));
 
-        let res = inner.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+        let res = inner
+            .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
+            .await;
 
         assert!(!res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
     }
@@ -945,8 +1124,8 @@ mod tests {
         ])
     }
 
-    #[test]
-    fn first_matching_rule_wins() {
+    #[tokio::test]
+    async fn first_matching_rule_wins() {
         let mut h = multi_rule_handler();
 
         let RequestOrResponse::Request(req) =
@@ -956,7 +1135,9 @@ mod tests {
         };
         assert_eq!(req.uri().to_string(), "http://127.0.0.1:1111/app/main.js");
 
-        let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+        let res = h
+            .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
+            .await;
 
         assert_eq!(res.headers()[header::CONTENT_SECURITY_POLICY], "policy-a");
     }
@@ -973,8 +1154,8 @@ mod tests {
         assert_eq!(req.uri().to_string(), "http://127.0.0.1:2222/other.js");
     }
 
-    #[test]
-    fn per_rule_csp_isolated() {
+    #[tokio::test]
+    async fn per_rule_csp_isolated() {
         let mut h = DevRedirect::new(vec![
             RedirectRule::new(
                 "plain.com".into(),
@@ -997,7 +1178,9 @@ mod tests {
         let req = request_to("plain.com", "/");
         let _ = h.handle_request_inner(req);
 
-        let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+        let res = h
+            .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
+            .await;
 
         assert_eq!(
             res.headers()[header::CONTENT_SECURITY_POLICY],

@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Live rules status page**: while running, rexy serves `http://127.0.0.1:8125/` (env `REXY_STATUS_PORT`, `0` = free port) with the fate of every intercepted connection and request — matched rule → target or miss with the reason (host not configured, no rule for the path), response status and duration. HTML page with SSE for humans, `GET /events` JSON feed (last 500 events) for harness scripts.
+- **Record and replay (`--record <dir>` / `--replay <file>`)**: intercepted exchanges are written to a HAR 1.2 file; a replay answers requests from the recording without the network — offline smoke runs. Matching is by method + URL (exact, then query-free), unmatched requests follow the usual rules; bodies are base64-encoded, headers replayed as-is.
 - **`REXY_PAC_ALL=1` env for `rexy run`**: routes *every* host through the proxy instead of only the intercepted ones (PAC returns `PROXY` unconditionally). Diagnostic-only escape hatch — it defeats the `DIRECT` optimization so traffic the browser would otherwise keep on a direct connection becomes interceptable (e.g. HTTP/2 long-polls). WebRTC/media may break while it is on.
 
 ### Fixed
