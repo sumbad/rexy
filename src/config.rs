@@ -18,6 +18,14 @@ struct FileRule {
     target: String,
     #[serde(default)]
     csp_override: Option<String>,
+    /// CONNECT-tunnel this host without decryption (escape hatch for pinned
+    /// clients and MITM-unfriendly WAFs). Default: intercept.
+    #[serde(default = "default_true")]
+    intercept: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_path() -> String {
@@ -98,7 +106,13 @@ fn rule_from_file(
 
     let csp_override = csp_override.map(|value| parse_csp_value(&value)).transpose()?;
 
-    Ok(RedirectRule::new(host, path, target, csp_override))
+    Ok(RedirectRule::new(
+        host,
+        path,
+        target,
+        csp_override,
+        rule.intercept,
+    ))
 }
 
 /// Expand environment variable references in a rule field, after TOML parsing
@@ -329,6 +343,29 @@ csp_override = "frame-ancestors *"
     }
 
     #[test]
+    fn intercept_defaults_to_true_and_parses_false() {
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "normal.example.com"
+target = "http://127.0.0.1:1111"
+
+[[rules]]
+host = "pinned.example.com"
+target = "http://127.0.0.1:1111"
+intercept = false
+"#,
+        );
+
+        let rules = load_rules(&path).unwrap();
+
+        assert!(rules[0].intercept());
+        assert!(!rules[1].intercept());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn empty_rules_list_is_ok() {
         let path = write_temp_config("rules = []\n");
         assert_eq!(load_rules(&path).unwrap().len(), 0);
@@ -408,7 +445,7 @@ csp_override = "frame-ancestors *\nX-Evil: y"
     }
 
     fn rule(host: &str, path: &str) -> RedirectRule {
-        RedirectRule::new(host.into(), path.into(), "http://127.0.0.1:1111".into(), None)
+        RedirectRule::new(host.into(), path.into(), "http://127.0.0.1:1111".into(), None, true)
     }
 
     #[test]

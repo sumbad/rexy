@@ -19,6 +19,7 @@ pub struct RedirectRule {
     path_prefix: String,
     local_target: String,
     csp_override: Option<CspOverride>,
+    intercept: bool,
 }
 
 impl RedirectRule {
@@ -27,12 +28,14 @@ impl RedirectRule {
         path_prefix: String,
         local_target: String,
         csp_override: Option<CspOverride>,
+        intercept: bool,
     ) -> Self {
         Self {
             prod_host: normalize_host(&prod_host),
             path_prefix: normalize_path_prefix(&path_prefix),
             local_target: local_target.trim_end_matches('/').to_string(),
             csp_override,
+            intercept,
         }
     }
 
@@ -50,6 +53,13 @@ impl RedirectRule {
 
     pub fn csp_override(&self) -> Option<&CspOverride> {
         self.csp_override.as_ref()
+    }
+
+    /// Whether rexy decrypts and can rewrite this host's traffic. With
+    /// `intercept = false` the host is CONNECT-tunneled untouched — the
+    /// escape hatch for pinned clients and MITM-unfriendly WAFs.
+    pub fn intercept(&self) -> bool {
+        self.intercept
     }
 
     /// Shared matcher: exact host (normalized) plus path-prefix match.
@@ -187,7 +197,7 @@ mod tests {
     use super::*;
 
     fn rule(host: &str, path: &str, target: &str) -> RedirectRule {
-        RedirectRule::new(host.into(), path.into(), target.into(), None)
+        RedirectRule::new(host.into(), path.into(), target.into(), None, true)
     }
 
     #[test]
