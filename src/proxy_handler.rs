@@ -172,7 +172,7 @@ impl HttpHandler for DevRedirect {
         _ctx: &HttpContext,
         req: Request<Body>,
     ) -> RequestOrResponse {
-        RequestOrResponse::Request(self.handle_request_inner(req))
+        self.handle_request_inner(req)
     }
 
     async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
@@ -181,16 +181,8 @@ impl HttpHandler for DevRedirect {
 }
 
 impl DevRedirect {
-    fn handle_request_inner(&mut self, mut req: Request<Body>) -> Request<Body> {
-        let edits = self.rewrite_request(&mut req);
-
-        self.pending_edits = edits;
-
-        req
-    }
-
-    fn rewrite_request(&self, req: &mut Request<Body>) -> ResponseEdits {
-        let matched = self.matching_rule(req);
+    fn handle_request_inner(&mut self, mut req: Request<Body>) -> RequestOrResponse {
+        let matched = self.matching_rule(&req);
 
         tracing::info!(
             method = %req.method(),
@@ -201,9 +193,37 @@ impl DevRedirect {
         );
 
         let Some(rule) = matched else {
-            return ResponseEdits::default();
+            self.pending_edits = ResponseEdits::default();
+            return RequestOrResponse::Request(req);
         };
 
+        // Map Local: a `file:` target serves static files directly instead of
+        // redirecting to a dev server. The response is built here, so its
+        // response edits are applied here too — `handle_response` never sees it.
+        if rule.is_file_target() {
+            let mut res = serve_from_file_target(&rule, &req);
+            let edits = ResponseEdits::from_rule(&rule);
+
+            if let Some(csp_override) = &edits.csp_override {
+                apply_csp_override(res.headers_mut(), csp_override);
+                tracing::info!(?csp_override, "csp override applied to file-target response");
+            }
+
+            if edits.embed {
+                strip_embed_blockers(res.headers_mut());
+            }
+
+            return RequestOrResponse::Response(res);
+        }
+
+        let edits = self.rewrite_request(&rule, &mut req);
+
+        self.pending_edits = edits;
+
+        RequestOrResponse::Request(req)
+    }
+
+    fn rewrite_request(&self, rule: &RedirectRule, req: &mut Request<Body>) -> ResponseEdits {
         let path_and_query = req
             .uri()
             .path_and_query()
@@ -245,7 +265,7 @@ impl DevRedirect {
             "redirecting request to local dev server"
         );
 
-        ResponseEdits::from_rule(&rule)
+        ResponseEdits::from_rule(rule)
     }
 
     fn handle_response_inner(&mut self, mut res: Response<Body>) -> Response<Body> {
@@ -263,6 +283,167 @@ impl DevRedirect {
 
         res
     }
+}
+
+/// Content-Type by file extension for Map Local responses. Text types carry
+/// a charset; unknown extensions are served as `application/octet-stream`.
+fn mime_type(path: &std::path::Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match ext.as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" | "map" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "wasm" => "application/wasm",
+        "txt" => "text/plain; charset=utf-8",
+        "xml" => "application/xml",
+        "pdf" => "application/pdf",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Decode `%XX` sequences of a URL path. `None` on malformed escapes or
+/// non-UTF-8 output.
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3)?;
+            let hi = (hex[0] as char).to_digit(16)?;
+            let lo = (hex[1] as char).to_digit(16)?;
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+
+    String::from_utf8(out).ok()
+}
+
+fn plain_response(status: hudsucker::hyper::StatusCode, body: &str) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CONTENT_LENGTH, body.len())
+        .body(Body::from(body.to_string()))
+        .expect("static response with fixed parts always builds")
+}
+
+/// Map Local: serve a request from the `file:<dir>` target's directory by the
+/// requested path — the cheap way to put local assets on top of prod without
+/// a dev server. `..` segments and symlink escapes are rejected; directories
+/// are not listed; the query string is not part of the lookup.
+fn serve_from_file_target(rule: &RedirectRule, req: &Request<Body>) -> Response<Body> {
+    use hudsucker::hyper::{Method, StatusCode};
+    use std::path::PathBuf;
+
+    let dir = rule.file_dir().expect("file target checked by caller");
+    let head = req.method() == Method::HEAD;
+
+    if req.method() != Method::GET && !head {
+        return plain_response(StatusCode::METHOD_NOT_ALLOWED, "only GET and HEAD are served\n");
+    }
+
+    let Some(url_path) = percent_decode(req.uri().path()) else {
+        return plain_response(StatusCode::BAD_REQUEST, "malformed path encoding\n");
+    };
+
+    let mut path = PathBuf::from(dir);
+    for segment in url_path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                tracing::warn!(path = %url_path, "rejected path traversal in file target");
+                return plain_response(StatusCode::FORBIDDEN, "path traversal rejected\n");
+            }
+            segment => path.push(segment),
+        }
+    }
+
+    let Ok(canonical_dir) = std::fs::canonicalize(dir) else {
+        tracing::error!(dir, "file target directory does not exist");
+        return plain_response(StatusCode::NOT_FOUND, "not found\n");
+    };
+
+    let Ok(canonical) = std::fs::canonicalize(&path) else {
+        return plain_response(StatusCode::NOT_FOUND, "not found\n");
+    };
+
+    if !canonical.starts_with(&canonical_dir) {
+        tracing::warn!(path = %url_path, "resolved outside the file target directory");
+        return plain_response(StatusCode::FORBIDDEN, "path traversal rejected\n");
+    }
+
+    if canonical.is_dir() {
+        return plain_response(StatusCode::NOT_FOUND, "not found\n");
+    }
+
+    let Ok(bytes) = std::fs::read(&canonical) else {
+        return plain_response(StatusCode::NOT_FOUND, "not found\n");
+    };
+
+    tracing::info!(
+        path = %url_path,
+        bytes = bytes.len(),
+        "serving file from file target"
+    );
+
+    let builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime_type(&canonical))
+        .header(header::CONTENT_LENGTH, bytes.len());
+
+    if head {
+        builder.body(Body::empty())
+    } else {
+        builder.body(Body::from(bytes))
+    }
+    .expect("static response with fixed parts always builds")
+}
+
+fn normalize_host(host: &str) -> String {
+    host.trim()
+        .trim_end_matches('.')
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+fn normalize_path_prefix(path: &str) -> String {
+    let mut value = if path.is_empty() {
+        "/".to_string()
+    } else {
+        path.to_string()
+    };
+
+    if !value.starts_with('/') {
+        value.insert(0, '/');
+    }
+
+    value
 }
 
 #[cfg(test)]
@@ -598,7 +779,11 @@ mod tests {
 
         // Plain-HTTP requests to the host reach the handler without a TLS
         // layer; they must pass through untouched as well.
-        let req = h.handle_request_inner(request_to("pinned.example.com", "/app.js"));
+        let RequestOrResponse::Request(req) =
+            h.handle_request_inner(request_to("pinned.example.com", "/app.js"))
+        else {
+            panic!("passthrough rules must pass requests through untouched");
+        };
         assert_eq!(req.uri().to_string(), "https://pinned.example.com/app.js");
         assert_eq!(req.headers()[header::HOST], "pinned.example.com");
     }
@@ -677,7 +862,11 @@ mod tests {
     fn first_matching_rule_wins() {
         let mut h = multi_rule_handler();
 
-        let req = h.handle_request_inner(request_to("example.com", "/app/main.js"));
+        let RequestOrResponse::Request(req) =
+            h.handle_request_inner(request_to("example.com", "/app/main.js"))
+        else {
+            panic!("redirect rules must pass the request through");
+        };
         assert_eq!(req.uri().to_string(), "http://127.0.0.1:1111/app/main.js");
 
         let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
@@ -689,7 +878,11 @@ mod tests {
     fn redirect_uses_matched_rule_target() {
         let mut h = multi_rule_handler();
 
-        let req = h.handle_request_inner(request_to("example.com", "/other.js"));
+        let RequestOrResponse::Request(req) =
+            h.handle_request_inner(request_to("example.com", "/other.js"))
+        else {
+            panic!("redirect rules must pass the request through");
+        };
         assert_eq!(req.uri().to_string(), "http://127.0.0.1:2222/other.js");
     }
 
@@ -723,6 +916,178 @@ mod tests {
             res.headers()[header::CONTENT_SECURITY_POLICY],
             "frame-ancestors 'self'"
         );
+    }
+
+    // ---- Map Local (file: targets) ----
+
+    fn file_rule(dir: &std::path::Path) -> RedirectRule {
+        RedirectRule::new(
+            "assets.example.com".into(),
+            "/".into(),
+            format!("file:{}", dir.display()),
+            None,
+            true,
+            false,
+        )
+    }
+
+    fn file_handler(dir: &std::path::Path) -> DevRedirect {
+        DevRedirect::new(vec![file_rule(dir)])
+    }
+
+    fn file_request(path: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(format!("https://assets.example.com{path}"))
+            .header(header::HOST, "assets.example.com")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn as_response(outcome: RequestOrResponse) -> Response<Body> {
+        let RequestOrResponse::Response(res) = outcome else {
+            panic!("file targets must answer with a response, not a rewritten request");
+        };
+        res
+    }
+
+    #[test]
+    fn file_target_serves_bytes_with_mime_type() {
+        let dir = std::env::temp_dir().join(format!("rexy-maplocal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("app.js"), b"console.log(1)").unwrap();
+        std::fs::write(dir.join("page.html"), b"<html></html>").unwrap();
+
+        let mut h = file_handler(&dir);
+
+        let res = as_response(h.handle_request_inner(file_request("/app.js?v=3")));
+        assert_eq!(res.status(), 200);
+        assert_eq!(
+            res.headers()[header::CONTENT_TYPE],
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(res.headers()[header::CONTENT_LENGTH], "14");
+
+        let res = as_response(h.handle_request_inner(file_request("/page.html")));
+        assert_eq!(
+            res.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_target_missing_file_is_404() {
+        let dir = std::env::temp_dir().join(format!("rexy-maplocal-404-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut h = file_handler(&dir);
+
+        let res = as_response(h.handle_request_inner(file_request("/nope.js")));
+        assert_eq!(res.status(), 404);
+
+        // Directories are not listed, including the root.
+        let res = as_response(h.handle_request_inner(file_request("/")));
+        assert_eq!(res.status(), 404);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_target_rejects_traversal() {
+        let dir = std::env::temp_dir().join(format!("rexy-maplocal-trav-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ok.txt"), b"ok").unwrap();
+
+        let mut h = file_handler(&dir);
+
+        // Literal .. and percent-encoded .. both must be rejected.
+        for path in ["/../secret.txt", "/a/../../secret.txt", "/%2e%2e/secret.txt"] {
+            let res = as_response(h.handle_request_inner(file_request(path)));
+            assert_eq!(res.status(), 403, "path {path} must be rejected");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_target_decodes_percent_escapes() {
+        let dir = std::env::temp_dir().join(format!("rexy-maplocal-esc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("my file.txt"), b"hello").unwrap();
+
+        let mut h = file_handler(&dir);
+
+        let res = as_response(h.handle_request_inner(file_request("/my%20file.txt")));
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()[header::CONTENT_TYPE], "text/plain; charset=utf-8");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_target_head_returns_headers_without_body() {
+        let dir = std::env::temp_dir().join(format!("rexy-maplocal-head-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("app.js"), b"console.log(1)").unwrap();
+
+        let mut h = file_handler(&dir);
+
+        let req = Request::builder()
+            .method("HEAD")
+            .uri("https://assets.example.com/app.js")
+            .header(header::HOST, "assets.example.com")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = as_response(h.handle_request_inner(req));
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()[header::CONTENT_LENGTH], "14");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_target_post_is_method_not_allowed() {
+        let dir = std::env::temp_dir().join(format!("rexy-maplocal-post-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut h = file_handler(&dir);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://assets.example.com/app.js")
+            .header(header::HOST, "assets.example.com")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = as_response(h.handle_request_inner(req));
+        assert_eq!(res.status(), 405);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_target_applies_csp_override() {
+        let dir = std::env::temp_dir().join(format!("rexy-maplocal-csp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("app.js"), b"console.log(1)").unwrap();
+
+        let mut h = DevRedirect::new(vec![RedirectRule::new(
+            "assets.example.com".into(),
+            "/".into(),
+            format!("file:{}", dir.display()),
+            Some(CspOverride::Off),
+            true,
+            false,
+        )]);
+
+        let res = as_response(h.handle_request_inner(file_request("/app.js")));
+        assert_eq!(res.status(), 200);
+        assert!(!res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

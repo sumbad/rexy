@@ -188,19 +188,24 @@ rexy run -f rules.toml
   traffic is never modified. Defaults to `false`; single-rule CLI mode has no flag for it.
 - An empty `rules` list is allowed: rexy logs a warning and runs without redirects.
 
-### Hot reload of the rules file
+### Map Local: serve local files instead of a dev server
 
-In `--file` mode rexy watches `rules.toml` and applies edits without restarting the proxy or the
-browser — the browser session (logins, profiles) survives. Changes are picked up within about a
-second:
+A rule with a `file:` target serves static files from a directory by the requested path — local
+assets on top of prod without running a dev server. `csp_override` applies to these responses too:
 
-- The rule set is swapped atomically; in-flight requests are unaffected.
-- The PAC script is regenerated when the set of hosts changes. Note: the browser re-fetches the
-  PAC on its own schedule (network-change events), so routes for *new* hosts start working after
-  the next PAC fetch; edits to paths/targets of already-intercepted hosts apply immediately.
-- A broken file (bad TOML, validation error) never kills the proxy: rexy logs a warning and keeps
-  the previous rule set until a valid version is saved.
-- Single-rule mode (`--host/--path/--target`) has no file to watch — restart to change it.
+```toml
+[[rules]]
+host = "app.example.com"
+path = "/static/"
+target = "file:/Users/me/build/static"
+csp_override = "off"
+```
+
+- Content-Type is derived from the file extension (html, js, css, json, images, fonts, wasm, …); unknown extensions are served as `application/octet-stream`.
+- Missing files and directories answer `404` — no directory listing. `..` segments and symlink escapes are rejected with `403`. The query string is not part of the lookup.
+- `GET` and `HEAD` are served; other methods answer `405`.
+- Works in `--file` configs and with the single-rule `--target file:<dir>`.
+- Out of scope by design: caching, directory listing, server-side includes.
 
 ### Commands
 

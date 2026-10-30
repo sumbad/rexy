@@ -65,6 +65,16 @@ impl RedirectRule {
         self.intercept
     }
 
+    /// Directory of a Map Local target (`target = "file:<dir>"`), if this
+    /// rule serves static files instead of redirecting to a dev server.
+    pub fn file_dir(&self) -> Option<&str> {
+        self.local_target.strip_prefix("file:")
+    }
+
+    pub(crate) fn is_file_target(&self) -> bool {
+        self.file_dir().is_some()
+    }
+
     /// Whether responses from this rule's target shed embedding blockers
     /// (`X-Frame-Options`, COOP/COEP/CORP) so the page can live in an iframe
     /// of a parent shell.
