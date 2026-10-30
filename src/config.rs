@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::proxy_handler::{CspOverride, RedirectRule};
+use crate::rules::{CspOverride, RedirectRule};
 
 #[derive(Debug, Deserialize)]
 struct ConfigFile {

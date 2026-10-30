@@ -1250,6 +1250,7 @@ dependencies = [
  "hyper-rustls",
  "rcgen",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",
