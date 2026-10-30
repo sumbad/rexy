@@ -209,11 +209,13 @@ target = "http://127.0.0.1:${OMICRON_PORT:-8124}"
 
 ### Commands
 
-| Command       | Description                                        |
-| ------------- | -------------------------------------------------- |
-| `rexy run`    | Launch the browser through the local proxy         |
-| `rexy trust`  | Install the Rexy Local CA into the OS trust store  |
-| `rexy clean`  | Remove the Rexy Local CA from the OS trust store   |
+| Command                | Description                                                       |
+| ---------------------- | ----------------------------------------------------------------- |
+| `rexy run`             | Launch the browser through the local proxy                        |
+| `rexy trust`           | Install the Rexy Local CA into the OS trust store                 |
+| `rexy trust --firefox` | Install the CA into Firefox profiles (NSS, via `certutil`)        |
+| `rexy clean`           | Remove the Rexy Local CA from the OS trust store                  |
+| `rexy clean --firefox` | Remove the CA from Firefox profiles                               |
 
 ### `run` options
 
@@ -238,6 +240,26 @@ matching falls back to the request URI host.
 
 HTTP/3/QUIC stays off: the browser is launched with `--disable-quic`, so all traffic remains
 TCP-based and interceptable.
+
+### Firefox support
+
+```sh
+rexy trust --firefox        # CA into every Firefox profile (NSS, via certutil)
+rexy run --browser firefox -f rules.toml
+```
+
+- Firefox has no proxy command-line flags, so `rexy run --browser firefox` creates a **throwaway
+  profile** (`$TMPDIR/rexy-firefox-profile-<pid>/`) with prefs pointing at the PAC URL and
+  disabling HTTP/3 — the Firefox equivalent of `--proxy-pac-url` + `--disable-quic`. The profile
+  is fresh every run: no stored session, exactly the isolation you want for a dev proxy.
+- The CA must be in the NSS store of the profile (`rexy trust --firefox` puts it into all
+  profiles); without `certutil` on PATH rexy prints the install hint instead of failing silently.
+- The OS trust store is not involved for Firefox: `rexy run --browser firefox` does not require
+  `rexy trust` to have run.
+- Verified on macOS; on Linux/Windows the flow is the same (`~/.mozilla/firefox` and
+  `%APPDATA%\Mozilla\Firefox` `profiles.ini`), with NSS tools installed per your distro.
+- HTTP/3/QUIC stays off by pref; enterprise policies and custom `certutil` locations are out of
+  scope.
 
 ### Logging
 

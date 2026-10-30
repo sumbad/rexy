@@ -11,10 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **HTTP/2 end-to-end**: the hudsucker `http2` feature is enabled and the upstream connector negotiates h2 via ALPN — intercepted hosts now behave like on prod (multiplexing, long-poll) instead of being downgraded to HTTP/1.1. HTTP/3/QUIC remains off (`--disable-quic`).
-- **Environment variables in rules**: `${VAR}` and `${VAR:-default}` interpolate into the string fields (`host`, `path`, `target`, `csp_override`) of a `--file` config — one shared `rules.toml` instead of machine-specific copies. Expansion runs after TOML parsing; `$$` escapes a literal `$`; a bare `$VAR` without braces stays literal; an unset variable without a default fails the load naming the variable, the rule and the field.
-- **Shadowed-rule warning at config load**: when an earlier rule (first-match-wins) makes a later, more specific rule unreachable — same host and the earlier path prefix covers the later path, including an exact duplicate — rexy logs a warning naming both rules and the reorder hint, instead of silently never firing the later rule.
-- **Docs: running an Electron app as the browser** — how `-- <browser args>` passthrough works, why the CDP port is an Electron argument (`--remote-debugging-port`), and that PAC routing behaves the same as in Chrome.
+- **Firefox support**: `rexy trust --firefox` installs the CA into every Firefox profile via NSS `certutil` (with a clear hint when it is missing); `rexy run --browser firefox` launches Firefox with a throwaway profile whose prefs point at the PAC and disable HTTP/3 (Firefox has no proxy CLI flags). Verified on macOS; Linux/Windows paths documented.
 - **`REXY_PAC_ALL=1` env for `rexy run`**: routes *every* host through the proxy instead of only the intercepted ones (PAC returns `PROXY` unconditionally). Diagnostic-only escape hatch — it defeats the `DIRECT` optimization so traffic the browser would otherwise keep on a direct connection becomes interceptable (e.g. HTTP/2 long-polls). WebRTC/media may break while it is on.
 
 ### Fixed
