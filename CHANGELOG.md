@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Map Local (`target = "file:<dir>"`)**: a rule can serve static files from a directory by the requested path instead of redirecting to a dev server — local assets on top of prod with no dev server. Content-Type by file extension, `404` for missing files/directories (no listing), `403` for path traversal, `csp_override` applies.
+- **Live rules status page**: while running, rexy serves `http://127.0.0.1:8125/` (env `REXY_STATUS_PORT`, `0` = free port) with the fate of every intercepted connection and request — matched rule → target or miss with the reason (host not configured, no rule for the path), response status and duration. HTML page with SSE for humans, `GET /events` JSON feed (last 500 events) for harness scripts.
 - **`REXY_PAC_ALL=1` env for `rexy run`**: routes *every* host through the proxy instead of only the intercepted ones (PAC returns `PROXY` unconditionally). Diagnostic-only escape hatch — it defeats the `DIRECT` optimization so traffic the browser would otherwise keep on a direct connection becomes interceptable (e.g. HTTP/2 long-polls). WebRTC/media may break while it is on.
 
 ### Fixed

@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use crate::rules::{CspOverride, RedirectRule, local_target_host};
+use crate::status::{Decision, EventLog, now_ms};
 use hudsucker::{
     Body, HttpContext, HttpHandler, RequestOrResponse,
     hyper::{HeaderMap, Request, Response, header},
@@ -63,32 +66,52 @@ impl ResponseEdits {
     }
 }
 
+/// Per-request correlation: the status event id, start time and response
+/// edits of the most recent matched request, consumed by `handle_response`
+/// of the same request.
+///
+/// hudsucker clones the handler per request, so this must NOT be an
+/// accumulating structure: a queue would leak entries from the CONNECT
+/// phase into every clone (clones are made from the instance that already
+/// processed CONNECT). Overwriting the field in `handle_request` makes
+/// inherited values irrelevant.
+#[derive(Clone, Debug)]
+struct Pending {
+    event_id: u64,
+    started_ms: u64,
+    edits: ResponseEdits,
+}
+
 #[derive(Clone, Debug)]
 pub struct DevRedirect {
     /// Current rule set, shared with the hot-reload watcher: the watcher
     /// swaps the contents while running handler clones keep reading.
     rules: std::sync::Arc<std::sync::RwLock<Vec<RedirectRule>>>,
-    /// CSP override of the most recent matched request, consumed by
-    /// `handle_response` of the same request.
-    ///
-    /// hudsucker clones the handler per request, so this must NOT be an
-    /// accumulating structure: a queue would leak entries from the CONNECT
-    /// phase into every clone (clones are made from the instance that already
-    /// processed CONNECT). Overwriting the field in `handle_request` makes
-    /// inherited values irrelevant.
-    pending_edits: ResponseEdits,
+    /// Shared status event log: the status page server reads what we record.
+    events: Arc<EventLog>,
+    pending: Option<Pending>,
 }
 
 impl DevRedirect {
     pub fn new(rules: Vec<RedirectRule>) -> Self {
+        Self::with_events(rules, EventLog::new())
+    }
+
+    pub fn with_events(rules: Vec<RedirectRule>, events: Arc<EventLog>) -> Self {
         Self {
             rules: std::sync::Arc::new(std::sync::RwLock::new(rules)),
-            pending_edits: ResponseEdits::default(),
+            events,
+            pending: None,
         }
     }
 
     pub fn rules_handle(&self) -> std::sync::Arc<std::sync::RwLock<Vec<RedirectRule>>> {
         std::sync::Arc::clone(&self.rules)
+    }
+
+    /// The shared event log handle for the status page server.
+    pub fn events_handle(&self) -> Arc<EventLog> {
+        Arc::clone(&self.events)
     }
 
     /// Host of an intercepted request: the `host` header, falling back to the
@@ -110,27 +133,39 @@ impl DevRedirect {
             .clone()
     }
 
-    fn matching_rule(&self, req: &Request<Body>) -> Option<RedirectRule> {
+    /// Index (first-match-wins) and a snapshot of the rule matching the
+    /// request. `intercept = false` rules never rewrite traffic: their host
+    /// is tunneled untouched, so a matching request must not be redirected
+    /// (plain-HTTP requests reach the handler without a TLS layer).
+    fn matching_rule_index(&self, req: &Request<Body>) -> Option<(usize, RedirectRule)> {
         let host = Self::request_host(req)?;
         let path = req.uri().path();
 
         let rules = self.rules.read().expect("rules lock is poisoned");
 
-        // `intercept = false` rules never rewrite traffic: their host is
-        // tunneled untouched, so a matching request must not be redirected
-        // (plain-HTTP requests reach the handler without a TLS layer).
         rules
             .iter()
-            .find(|rule| rule.intercept() && rule.matches(&host, path))
-            .cloned()
+            .enumerate()
+            .find(|(_, rule)| rule.intercept() && rule.matches(&host, path))
+            .map(|(index, rule)| (index, rule.clone()))
     }
 
+    /// Whether the host has any rule at all (for miss-reason wording).
     fn matches_any_host(&self, host: &str) -> bool {
         self.rules
             .read()
             .expect("rules lock is poisoned")
             .iter()
             .any(|rule| rule.matches_host(host))
+    }
+
+    /// Whether the host has an interceptable rule.
+    fn has_interceptable_host(&self, host: &str) -> bool {
+        self.rules
+            .read()
+            .expect("rules lock is poisoned")
+            .iter()
+            .any(|rule| rule.intercept() && rule.matches_host(host))
     }
 
     /// TLS interception decision for an SNI host: decrypt only when some rule
@@ -152,15 +187,37 @@ impl HttpHandler for DevRedirect {
         client_hello: hudsucker::rustls::server::ClientHello<'_>,
     ) -> bool {
         let Some(server_name) = client_hello.server_name() else {
+            self.events.record_connect(
+                "",
+                Decision::Missed {
+                    reason: "no SNI in ClientHello".into(),
+                },
+            );
             return false;
         };
 
         let intercept = self.should_intercept(server_name);
 
-        if !intercept && self.matches_any_host(server_name) {
+        if intercept {
+            self.events.record_connect(
+                server_name,
+                Decision::Matched {
+                    rule_index: 0,
+                    target: "(TLS decrypted)".into(),
+                },
+            );
+        } else if self.matches_any_host(server_name) {
             tracing::info!(
                 host = %server_name,
                 "TLS passthrough: rule sets intercept = false"
+            );
+            self.events.record_connect(server_name, Decision::Tunnel);
+        } else {
+            self.events.record_connect(
+                server_name,
+                Decision::Missed {
+                    reason: "host not configured".into(),
+                },
             );
         }
 
@@ -182,7 +239,7 @@ impl HttpHandler for DevRedirect {
 
 impl DevRedirect {
     fn handle_request_inner(&mut self, mut req: Request<Body>) -> RequestOrResponse {
-        let matched = self.matching_rule(&req);
+        let matched = self.matching_rule_index(&req);
 
         tracing::info!(
             method = %req.method(),
@@ -192,14 +249,51 @@ impl DevRedirect {
             "HTTP request"
         );
 
-        let Some(rule) = matched else {
-            self.pending_edits = ResponseEdits::default();
+        let host = Self::request_host(&req).unwrap_or_default();
+        let path = req.uri().path().to_string();
+        let method = req.method().to_string();
+        let started_ms = now_ms();
+
+        let Some((rule_index, rule)) = matched else {
+            let reason = if self.has_interceptable_host(&host) {
+                "no rule matched the path"
+            } else if self.matches_any_host(&host) {
+                "host is TLS passthrough (intercept = false)"
+            } else {
+                "host not configured"
+            };
+
+            let event_id = self.events.record_request(
+                &method,
+                &host,
+                &path,
+                Decision::Missed {
+                    reason: reason.into(),
+                },
+            );
+            self.pending = Some(Pending {
+                event_id,
+                started_ms,
+                edits: ResponseEdits::default(),
+            });
+
             return RequestOrResponse::Request(req);
         };
 
+        let event_id = self.events.record_request(
+            &method,
+            &host,
+            &path,
+            Decision::Matched {
+                rule_index,
+                target: rule.target().to_string(),
+            },
+        );
+
         // Map Local: a `file:` target serves static files directly instead of
         // redirecting to a dev server. The response is built here, so its
-        // response edits are applied here too — `handle_response` never sees it.
+        // response edits and outcome are recorded here too —
+        // `handle_response` never sees it.
         if rule.is_file_target() {
             let mut res = serve_from_file_target(&rule, &req);
             let edits = ResponseEdits::from_rule(&rule);
@@ -213,12 +307,22 @@ impl DevRedirect {
                 strip_embed_blockers(res.headers_mut());
             }
 
+            self.events.record_response(
+                event_id,
+                res.status().as_u16(),
+                now_ms().saturating_sub(started_ms),
+            );
+
             return RequestOrResponse::Response(res);
         }
 
         let edits = self.rewrite_request(&rule, &mut req);
 
-        self.pending_edits = edits;
+        self.pending = Some(Pending {
+            event_id,
+            started_ms,
+            edits,
+        });
 
         RequestOrResponse::Request(req)
     }
@@ -269,16 +373,22 @@ impl DevRedirect {
     }
 
     fn handle_response_inner(&mut self, mut res: Response<Body>) -> Response<Body> {
-        let edits = std::mem::take(&mut self.pending_edits);
+        if let Some(pending) = self.pending.take() {
+            if let Some(csp_override) = &pending.edits.csp_override {
+                apply_csp_override(res.headers_mut(), csp_override);
 
-        if let Some(csp_override) = &edits.csp_override {
-            apply_csp_override(res.headers_mut(), csp_override);
+                tracing::info!(?csp_override, "csp override applied to redirected response");
+            }
 
-            tracing::info!(?csp_override, "csp override applied to redirected response");
-        }
+            if pending.edits.embed {
+                strip_embed_blockers(res.headers_mut());
+            }
 
-        if edits.embed {
-            strip_embed_blockers(res.headers_mut());
+            self.events.record_response(
+                pending.event_id,
+                res.status().as_u16(),
+                now_ms().saturating_sub(pending.started_ms),
+            );
         }
 
         res
@@ -421,29 +531,6 @@ fn serve_from_file_target(rule: &RedirectRule, req: &Request<Body>) -> Response<
         builder.body(Body::from(bytes))
     }
     .expect("static response with fixed parts always builds")
-}
-
-fn normalize_host(host: &str) -> String {
-    host.trim()
-        .trim_end_matches('.')
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase()
-}
-
-fn normalize_path_prefix(path: &str) -> String {
-    let mut value = if path.is_empty() {
-        "/".to_string()
-    } else {
-        path.to_string()
-    };
-
-    if !value.starts_with('/') {
-        value.insert(0, '/');
-    }
-
-    value
 }
 
 #[cfg(test)]

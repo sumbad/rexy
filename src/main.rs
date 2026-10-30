@@ -4,6 +4,7 @@ mod config;
 mod pac;
 mod proxy_handler;
 mod rules;
+mod status;
 mod trust;
 
 use clap::{Parser, Subcommand};
@@ -209,7 +210,33 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let ca = ca::load_ca()?;
 
+    // Status page: live rule decisions for humans (HTML/SSE) and harness
+    // scripts (JSON). A busy port degrades to a warning, not a failure —
+    // the proxy itself does not depend on it.
+    let status_port: u16 = std::env::var("REXY_STATUS_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8125);
+
     let handler = DevRedirect::new(rules);
+
+    let status_listener = match TcpListener::bind(("127.0.0.1", status_port)).await {
+        Ok(listener) => Some(listener),
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                port = status_port,
+                "status page port is unavailable; running without it (set REXY_STATUS_PORT)"
+            );
+            None
+        }
+    };
+
+    if let Some(status_listener) = status_listener {
+        let status_addr = status_listener.local_addr()?;
+        tokio::spawn(status::serve(status_listener, handler.events_handle()));
+        info!("status page: http://{status_addr}/");
+    }
 
     // Hot reload: watch the rules file so edits apply without restarting the
     // proxy or the browser (keeping the browser session alive is the point).

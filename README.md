@@ -231,36 +231,20 @@ csp_override = "off"
 | `--csp-override <policy\|off>` | —      | Replace all `Content-Security-Policy` headers of responses served from `--target` (`off` removes them); passthrough traffic is untouched |
 | `-- <args>`                | —          | Extra arguments passed to the browser                              |
 
-### HTTP/2
+### Rules status page
 
-Rexy speaks HTTP/2 end-to-end for intercepted hosts: the browser connects to the proxy over h2 and
-the proxy negotiates h2 with the upstream via ALPN whenever the target supports it — multiplexing
-and long-poll behave like they do on prod. This matters for matching too: HTTP/2 requests carry
-the authority in the `:authority` pseudo-header instead of a `host` header, which is why rule
-matching falls back to the request URI host.
+While running, rexy serves a live status page — `http://127.0.0.1:8125/` by default (env
+`REXY_STATUS_PORT`, `0` picks a free port). It shows the fate of every intercepted connection and
+request: which rule matched (rule number → target) or why not (host not configured, no rule for
+the path), plus the response status and round-trip duration. The "the rule did not match,
+silently" class of problems becomes visible at a glance.
 
-HTTP/3/QUIC stays off: the browser is launched with `--disable-quic`, so all traffic remains
-TCP-based and interceptable.
+- `GET /` — HTML page with live updates (Server-Sent Events).
+- `GET /events` — JSON array of the last 500 events, newest first — the feed for harness scripts.
+- `GET /stream` — SSE stream of new and updated events.
 
-### Firefox support
-
-```sh
-rexy trust --firefox        # CA into every Firefox profile (NSS, via certutil)
-rexy run --browser firefox -f rules.toml
-```
-
-- Firefox has no proxy command-line flags, so `rexy run --browser firefox` creates a **throwaway
-  profile** (`$TMPDIR/rexy-firefox-profile-<pid>/`) with prefs pointing at the PAC URL and
-  disabling HTTP/3 — the Firefox equivalent of `--proxy-pac-url` + `--disable-quic`. The profile
-  is fresh every run: no stored session, exactly the isolation you want for a dev proxy.
-- The CA must be in the NSS store of the profile (`rexy trust --firefox` puts it into all
-  profiles); without `certutil` on PATH rexy prints the install hint instead of failing silently.
-- The OS trust store is not involved for Firefox: `rexy run --browser firefox` does not require
-  `rexy trust` to have run.
-- Verified on macOS; on Linux/Windows the flow is the same (`~/.mozilla/firefox` and
-  `%APPDATA%\Mozilla\Firefox` `profiles.ini`), with NSS tools installed per your distro.
-- HTTP/3/QUIC stays off by pref; enterprise policies and custom `certutil` locations are out of
-  scope.
+If the port is busy, rexy logs a warning and runs without the page — the proxy itself is
+unaffected.
 
 ### Logging
 
@@ -275,6 +259,7 @@ RUST_LOG=debug rexy run ...
 | Variable       | Default | Description                                                                                       |
 | -------------- | ------- | ------------------------------------------------------------------------------------------------- |
 | `RUST_LOG`     | —       | `tracing` log filter (see [Logging](#logging))                                                      |
+| `REXY_STATUS_PORT` | `8125`  | Port of the live [rules status page](#rules-status-page); `0` picks a free port. If the port is busy, rexy runs without the page. |
 | `REXY_PAC_ALL` | unset   | When `1`, the PAC routes **every** host through the proxy (not just intercepted ones). Diagnostic escape hatch: it defeats the `DIRECT` optimization so traffic the browser would otherwise keep on a direct connection (e.g. HTTP/2 long-polls) becomes interceptable. WebRTC/media may break while it is on. |
 
 ## Security notes
