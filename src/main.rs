@@ -170,10 +170,15 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     .with_native_roots()?
     .with_no_client_auth();
 
+    // HTTP/2 end-to-end: prod pages live on h2 (multiplexing, long-poll),
+    // so the upstream connection negotiates h2 via ALPN whenever the target
+    // supports it. HTTP/3/QUIC stays off — the browser is launched with
+    // --disable-quic.
     let upstream_connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(upstream_tls)
         .https_or_http()
         .enable_http1()
+        .enable_http2()
         .build();
 
     let proxy = Proxy::builder()
