@@ -349,4 +349,50 @@ mod tests {
             serde_json::json!({"url": "https://a.example.com/x", "matched": false})
         );
     }
+
+    #[test]
+    fn matched_outcome_json_contract() {
+        // The JSON feed is a contract for harness scripts: field names and
+        // the csp_override spelling ("off" vs the policy string) are fixed.
+        let rules = vec![
+            RedirectRule::new(
+                "app.example.com".into(),
+                "/api/".into(),
+                "http://127.0.0.1:8123".into(),
+                Some(CspOverride::Off),
+                true,
+                false,
+            ),
+            RedirectRule::new(
+                "app.example.com".into(),
+                "/web/".into(),
+                "http://127.0.0.1:8124".into(),
+                Some(CspOverride::Policy("frame-ancestors *".into())),
+                true,
+                false,
+            ),
+        ];
+
+        let outcome = check_url(&rules, "https://app.example.com/api/v1/get").unwrap();
+        assert!(outcome.matched);
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "url": "https://app.example.com/api/v1/get",
+                "matched": true,
+                "rule_index": 0,
+                "rule_host": "app.example.com",
+                "rule_path": "/api/",
+                "target": "http://127.0.0.1:8123",
+                "csp_override": "off",
+            })
+        );
+
+        let outcome = check_url(&rules, "https://app.example.com/web/main.js").unwrap();
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["rule_index"], 1);
+        assert_eq!(json["target"], "http://127.0.0.1:8124");
+        assert_eq!(json["csp_override"], "frame-ancestors *");
+    }
 }

@@ -1434,6 +1434,39 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn file_target_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("file-symlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ok.txt"), b"ok").unwrap();
+
+        // A file outside the target directory, reachable through a symlink
+        // inside it: canonicalize() resolves the link, and the resolved path
+        // must fail the starts_with check.
+        let outside = temp_dir("file-symlink-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+        symlink(outside.join("secret.txt"), dir.join("escape.txt")).unwrap();
+
+        let mut h = file_handler(&dir);
+
+        let res = as_response(h.handle_request_inner(file_request("/escape.txt")));
+        assert_eq!(res.status(), 403);
+
+        // A symlink staying inside the directory still serves.
+        std::fs::write(dir.join("real.txt"), b"real").unwrap();
+        symlink(dir.join("real.txt"), dir.join("alias.txt")).unwrap();
+        let res = as_response(h.handle_request_inner(file_request("/alias.txt")));
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()[header::CONTENT_LENGTH], "4");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
     #[test]
     fn file_target_decodes_percent_escapes() {
         let dir = std::env::temp_dir().join(format!("rexy-maplocal-esc-{}", std::process::id()));
@@ -1781,6 +1814,50 @@ mod tests {
         };
         assert!(reason.contains("no fixture"), "{reason}");
         assert!(reason.contains("host not configured"), "{reason}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn replay_has_priority_over_rules_and_misses_fall_through() {
+        let dir = temp_dir("replay-priority");
+        std::fs::create_dir_all(&dir).unwrap();
+        let har_path = dir.join("session.har");
+        // Fixture for one URL on a host that also has a rewrite rule.
+        let raw = r#"{"log":{"version":"1.2","creator":{"name":"x","version":"1"},"entries":[{"startedDateTime":"2026-01-01T00:00:00.000Z","time":0,"request":{"method":"GET","url":"https://a.example.com/fixed","httpVersion":"HTTP/1.1","headers":[],"queryString":[],"cookies":[],"headersSize":-1,"bodySize":-1},"response":{"status":200,"statusText":"","httpVersion":"HTTP/1.1","headers":[],"content":{"size":7,"mimeType":"text/plain","text":"Zml4dHVyZQ==","encoding":"base64"},"headersSize":-1,"bodySize":7}}]}}"#;
+        std::fs::write(&har_path, raw).unwrap();
+
+        let replayer = Replayer::open(&har_path).unwrap();
+        let mut h = DevRedirect::with_fixtures(
+            vec![RedirectRule::new(
+                "a.example.com".into(),
+                "/".into(),
+                "http://127.0.0.1:9999".into(),
+                None,
+                true,
+                false,
+            )],
+            None,
+            Some(std::sync::Arc::new(replayer)),
+        );
+
+        // The fixture wins over the rule: the answer never reaches the
+        // target and is not a rewritten request.
+        let outcome = h.handle_request_inner(request_to("a.example.com", "/fixed"));
+        let res = match outcome {
+            RequestOrResponse::Response(res) => res,
+            RequestOrResponse::Request(_) => {
+                panic!("a fixture hit must answer with a response, not a rewrite")
+            }
+        };
+        assert_eq!(res.status(), 200);
+
+        // No fixture for this URL: the usual rules apply.
+        let outcome = h.handle_request_inner(request_to("a.example.com", "/unmatched"));
+        let RequestOrResponse::Request(req) = outcome else {
+            panic!("a replay miss must fall through to the rules");
+        };
+        assert_eq!(req.uri().to_string(), "http://127.0.0.1:9999/unmatched");
 
         std::fs::remove_dir_all(&dir).ok();
     }
