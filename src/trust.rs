@@ -93,7 +93,7 @@ fn install_macos(cert: &std::path::Path) -> Result<(), Box<dyn std::error::Error
         .status();
 
     run(
-        "security",
+        std::path::Path::new("security"),
         &[
             "add-trusted-cert",
             "-r",
@@ -150,8 +150,11 @@ fn check_macos() -> bool {
 
 #[cfg(target_os = "windows")]
 fn install_windows(cert: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    // The OS-trust-store ops run the built-in Windows certutil on purpose
+    // (bare name — always in System32); it is the NSS certutil that must be
+    // resolved explicitly, see `which_certutil_in`.
     run(
-        "certutil",
+        std::path::Path::new("certutil"),
         &[
             "-user",
             "-addstore",
@@ -165,7 +168,10 @@ fn install_windows(cert: &std::path::Path) -> Result<(), Box<dyn std::error::Err
 
 #[cfg(target_os = "windows")]
 fn remove_windows() -> Result<(), Box<dyn std::error::Error>> {
-    run("certutil", &["-user", "-delstore", "Root", CA_NAME])?;
+    run(
+        std::path::Path::new("certutil"),
+        &["-user", "-delstore", "Root", CA_NAME],
+    )?;
 
     Ok(())
 }
@@ -193,7 +199,7 @@ fn install_linux(cert: &std::path::Path) -> Result<(), Box<dyn std::error::Error
         return Err("failed to copy CA to system trust store".into());
     }
 
-    run("pkexec", &["update-ca-certificates"])?;
+    run(std::path::Path::new("pkexec"), &["update-ca-certificates"])?;
 
     Ok(())
 }
@@ -201,7 +207,7 @@ fn install_linux(cert: &std::path::Path) -> Result<(), Box<dyn std::error::Error
 #[cfg(target_os = "linux")]
 fn remove_linux() -> Result<(), Box<dyn std::error::Error>> {
     run(
-        "pkexec",
+        std::path::Path::new("pkexec"),
         &[
             "rm",
             "-f",
@@ -209,7 +215,7 @@ fn remove_linux() -> Result<(), Box<dyn std::error::Error>> {
         ],
     )?;
 
-    run("pkexec", &["update-ca-certificates"])?;
+    run(std::path::Path::new("pkexec"), &["update-ca-certificates"])?;
 
     Ok(())
 }
@@ -321,13 +327,10 @@ pub fn install_firefox() -> Result<(), Box<dyn std::error::Error>> {
         return Err("no Firefox profiles found in profiles.ini".into());
     }
 
-    if which_certutil().is_none() {
-        return Err(certutil_hint().into());
-    }
-
+    let certutil = which_certutil().ok_or(certutil_hint())?;
     let der = ca_der()?;
 
-    let result = install_into_profiles(&dirs, &der);
+    let result = install_into_profiles(&dirs, &der, &certutil);
 
     // The DER copy in the shared temp dir must not outlive the install:
     // fs::write follows symlinks, so leaving a file at a predictable path
@@ -338,16 +341,18 @@ pub fn install_firefox() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Ensure the NSS DB exists in `dir` (created with an empty password when
-/// the profile has never been used) and import the CA from `der`.
+/// the profile has never been used) and import the CA from `der`, invoking
+/// the resolved NSS `certutil` by its absolute path.
 fn import_into_nss_dir(
     dir: &std::path::Path,
     der: &std::path::Path,
+    certutil: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // NSS DB must exist before -A; create it silently when the profile
     // has never been used.
     if !dir.join("cert9.db").exists() {
         run(
-            "certutil",
+            certutil,
             &[
                 "-N",
                 "-d",
@@ -358,7 +363,7 @@ fn import_into_nss_dir(
     }
 
     run(
-        "certutil",
+        certutil,
         &[
             "-A",
             "-d",
@@ -378,6 +383,7 @@ fn import_into_nss_dir(
 fn install_into_profiles(
     dirs: &[std::path::PathBuf],
     der: &std::path::Path,
+    certutil: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let mut installed = 0usize;
     for dir in dirs {
@@ -386,7 +392,7 @@ fn install_into_profiles(
             continue;
         }
 
-        import_into_nss_dir(dir, der)?;
+        import_into_nss_dir(dir, der, certutil)?;
 
         println!(
             "✓ {CA_NAME} installed into Firefox profile {}",
@@ -409,12 +415,10 @@ fn install_into_profiles(
 pub(crate) fn import_ca_into_nss_profile(
     dir: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if which_certutil().is_none() {
-        return Err(certutil_hint().into());
-    }
+    let certutil = which_certutil().ok_or(certutil_hint())?;
 
     let der = ca_der()?;
-    let result = import_into_nss_dir(dir, &der);
+    let result = import_into_nss_dir(dir, &der, &certutil);
     // The temp DER copy must not outlive the import (see ca_der).
     let _ = fs::remove_file(&der);
     result
@@ -429,9 +433,10 @@ pub fn remove_firefox() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("Firefox profiles.ini not found at {}", ini.display()).into());
     }
 
-    if which_certutil().is_none() {
-        return Err(certutil_hint().into());
-    }
+    // Resolve the NSS certutil up front: the built-in Windows certutil.exe
+    // (always on PATH) must never stand in for it, or the removal below
+    // would silently do nothing while the success line still prints.
+    let certutil = which_certutil().ok_or(certutil_hint())?;
 
     let ini_dir = ini
         .parent()
@@ -442,7 +447,7 @@ pub fn remove_firefox() -> Result<(), Box<dyn std::error::Error>> {
     for dir in dirs {
         // -D fails when the nickname is absent — that is the expected state
         // for profiles never touched by rexy, so ignore the exit status.
-        let _ = std::process::Command::new("certutil")
+        let _ = std::process::Command::new(&certutil)
             .args(["-D", "-d", &format!("sql:{}", dir.display()), "-n", CA_NAME])
             .status();
     }
@@ -462,11 +467,57 @@ fn certutil_binary_name() -> &'static str {
     }
 }
 
+/// Windows system directories that must never satisfy the NSS certutil
+/// lookup: the OS ships its own unrelated `certutil.exe` there, it is always
+/// on PATH, and CreateProcess resolves the bare `certutil` name to it even
+/// when the NSS tools come later — the NSS tool must be addressed by its
+/// resolved absolute path instead.
+#[cfg(windows)]
+fn windows_system_roots() -> Vec<std::path::PathBuf> {
+    let root = std::env::var("SystemRoot")
+        .or_else(|_| std::env::var("WINDIR"))
+        .unwrap_or_else(|_| r"C:\Windows".to_string());
+
+    vec![std::path::PathBuf::from(root)]
+}
+
+#[cfg(not(windows))]
+fn windows_system_roots() -> Vec<std::path::PathBuf> {
+    Vec::new()
+}
+
+/// Whether `dir` lives under one of the system roots. Pure over the roots so
+/// tests can inject fake ones; Windows paths are case-insensitive.
+fn is_system_dir(dir: &std::path::Path, system_roots: &[std::path::PathBuf]) -> bool {
+    let dir = dir.to_string_lossy().to_ascii_lowercase();
+
+    system_roots
+        .iter()
+        .any(|root| dir.starts_with(&root.to_string_lossy().to_ascii_lowercase()))
+}
+
+/// Resolve the NSS `certutil` in the given PATH directories, skipping the
+/// system directories (see `windows_system_roots`). Pure over both inputs so
+/// tests can inject fake directories instead of depending on the machine's
+/// real PATH.
+fn which_certutil_in(
+    dirs: impl Iterator<Item = std::path::PathBuf>,
+    system_roots: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    let binary = certutil_binary_name();
+
+    dirs.into_iter()
+        .filter(|dir| !is_system_dir(dir, system_roots))
+        .map(|dir| dir.join(binary))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The resolved absolute path of the NSS certutil, if present on PATH.
 fn which_certutil() -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(certutil_binary_name()))
-        .find(|candidate| candidate.is_file())
+    let system_roots = windows_system_roots();
+
+    which_certutil_in(std::env::split_paths(&path), &system_roots)
 }
 
 /// DER bytes of the local CA: certutil -A expects DER, while `ca/rexy.cer`
@@ -499,11 +550,15 @@ fn ca_der() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     Ok(tmp)
 }
 
-fn run(program: &str, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+/// Run `program` with `args`. NSS invocations pass the resolved absolute
+/// path (see `which_certutil_in`); the OS-store tools (`security`, `pkexec`,
+/// the built-in Windows `certutil`) are addressed by their bare name on
+/// purpose — CreateProcess must pick the system one for them.
+fn run(program: &std::path::Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
     let status = std::process::Command::new(program).args(args).status()?;
 
     if !status.success() {
-        return Err(format!("{program} exited with status {status}").into());
+        return Err(format!("{} exited with status {status}", program.display()).into());
     }
 
     Ok(())
@@ -570,5 +625,43 @@ Path=/Users/me/FirefoxProfiles/work
         } else {
             assert_eq!(certutil_binary_name(), "certutil");
         }
+    }
+
+    #[test]
+    fn certutil_lookup_skips_windows_system_directories() {
+        let base = std::env::temp_dir().join(format!("rexy-certutil-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        let system_dir = base.join("System32");
+        let nss_dir = base.join("nss");
+        std::fs::create_dir_all(&system_dir).unwrap();
+        std::fs::create_dir_all(&nss_dir).unwrap();
+
+        let binary = certutil_binary_name();
+        std::fs::write(system_dir.join(binary), b"fake").unwrap();
+        std::fs::write(nss_dir.join(binary), b"fake").unwrap();
+
+        // The system directory ships its own unrelated certutil — it must be
+        // skipped even though a binary exists there, or the built-in Windows
+        // tool would always win the lookup.
+        let system_roots = vec![system_dir.clone()];
+        assert_eq!(
+            which_certutil_in([system_dir.clone()].into_iter(), &system_roots),
+            None
+        );
+
+        // The NSS directory is found and resolved to its absolute path.
+        assert_eq!(
+            which_certutil_in([nss_dir.clone()].into_iter(), &system_roots),
+            Some(nss_dir.join(binary))
+        );
+
+        // The real Windows layout — System32 first on PATH — still resolves
+        // to the NSS tool.
+        assert_eq!(
+            which_certutil_in([system_dir, nss_dir.clone()].into_iter(), &system_roots),
+            Some(nss_dir.join(binary))
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }
