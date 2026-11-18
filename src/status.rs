@@ -304,6 +304,32 @@ fn request_host_header(request: &str) -> Option<&str> {
     })
 }
 
+/// Whether the `Host` header names this server itself. The header is parsed
+/// as host:port: clients legitimately omit the port (curl on the default
+/// port 80 sends `Host: localhost`), append trailing root dots
+/// (`localhost.`) and use any case (`LocalHost`) — all of those must pass.
+/// Anything else (a rebinding host resolved to 127.0.0.1) is refused.
+fn is_local_host(host_header: &str, bound_port: u16) -> bool {
+    let host_header = host_header.trim_end_matches('.');
+
+    // Split off the port at the last colon; a tail that is not purely
+    // numeric (an unbracketed IPv6 literal, for instance) means no port.
+    let (host, port) = match host_header.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+            match port.parse::<u16>() {
+                Ok(port) => (host, Some(port)),
+                Err(_) => return false,
+            }
+        }
+        _ => (host_header, None),
+    };
+
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let port = port.unwrap_or(bound_port);
+
+    (host == "127.0.0.1" || host == "localhost") && port == bound_port
+}
+
 async fn handle(mut socket: TcpStream, log: Arc<EventLog>, bound_port: u16) -> std::io::Result<()> {
     let mut buf = [0u8; 2048];
     let mut seen = 0usize;
@@ -322,15 +348,10 @@ async fn handle(mut socket: TcpStream, log: Arc<EventLog>, bound_port: u16) -> s
     let request = String::from_utf8_lossy(&buf[..seen]);
 
     // DNS rebinding guard: the status server is a localhost diagnostic that
-    // exposes the rule decisions, so only the addresses it is bound to may
+    // exposes the rule decisions, so only the local names it is bound to may
     // address it. A page from any other origin (its host resolved to
     // 127.0.0.1 by a rebinding attack) is refused before any body is sent.
-    let allowed_hosts = [
-        format!("127.0.0.1:{bound_port}"),
-        format!("localhost:{bound_port}"),
-    ];
-    if !request_host_header(&request).is_some_and(|host| allowed_hosts.contains(&host.to_string()))
-    {
+    if !request_host_header(&request).is_some_and(|host| is_local_host(host, bound_port)) {
         socket
             .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .await?;
@@ -408,12 +429,31 @@ async fn handle(mut socket: TcpStream, log: Arc<EventLog>, bound_port: u16) -> s
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Missed notifications: re-send everything newer
-                        // than what this client got (ids are monotonic).
-                        // Events already evicted from the ring are gone for
-                        // good — the newest ones still arrive.
+                        // Missed notifications. The ids the receiver still
+                        // retains are drained here (try_recv consumes them,
+                        // so recv() would never re-deliver them) and re-sent
+                        // below, after the older catch-up ids — the retained
+                        // ones are the newest, so the client still sees ids
+                        // in ascending order without duplicates.
+                        let mut retained = Vec::new();
+                        loop {
+                            match receiver.try_recv() {
+                                Ok(id) => retained.push(id),
+                                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                                Err(_) => break,
+                            }
+                        }
+                        retained.sort_unstable();
+                        retained.dedup();
+                        let retained_set: std::collections::HashSet<u64> =
+                            retained.iter().copied().collect();
+
+                        // Everything else newer than what this client got is
+                        // fetched from the ring (ids are monotonic). Events
+                        // already evicted from the ring are gone for good —
+                        // the newest ones still arrive.
                         for event in log.snapshot().into_iter().rev() {
-                            if event.id <= last_sent_id {
+                            if event.id <= last_sent_id || retained_set.contains(&event.id) {
                                 continue;
                             }
                             let line = format!(
@@ -423,7 +463,20 @@ async fn handle(mut socket: TcpStream, log: Arc<EventLog>, bound_port: u16) -> s
                             if socket.write_all(line.as_bytes()).await.is_err() {
                                 return Ok(());
                             }
-                            last_sent_id = event.id;
+                            last_sent_id = last_sent_id.max(event.id);
+                        }
+
+                        for id in retained {
+                            if let Some(event) = log.get(id) {
+                                let line = format!(
+                                    "data: {}\n\n",
+                                    serde_json::to_string(&event).unwrap_or_default()
+                                );
+                                if socket.write_all(line.as_bytes()).await.is_err() {
+                                    return Ok(());
+                                }
+                                last_sent_id = last_sent_id.max(id);
+                            }
                         }
                         let _ = socket.flush().await;
                     }
@@ -605,6 +658,50 @@ mod tests {
         assert!(response.contains("403"), "{response}");
     }
 
+    #[test]
+    fn is_local_host_accepts_client_host_variations() {
+        // The port may be omitted (curl sends `Host: localhost` on the
+        // default port 80); an omitted port counts as the bound one.
+        assert!(is_local_host("localhost", 80));
+        assert!(is_local_host("localhost", 8125));
+        assert!(is_local_host("127.0.0.1", 8125));
+        assert!(is_local_host("LOCALHOST", 8125));
+
+        // Case-insensitive, trailing root dots on the host or after the
+        // port, and an explicit correct port all pass.
+        assert!(is_local_host("LocalHost:8125", 8125));
+        assert!(is_local_host("localhost.:8125", 8125));
+        assert!(is_local_host("localhost:8125.", 8125));
+        assert!(is_local_host("127.0.0.1:8125", 8125));
+
+        // Anything else is refused: other hosts, wrong ports.
+        assert!(!is_local_host("evil.example.com:8125", 8125));
+        assert!(!is_local_host("127.0.0.1:9999", 8125));
+        assert!(!is_local_host("localhost:80", 8125));
+        assert!(!is_local_host("localhost.:8125", 9999));
+    }
+
+    #[tokio::test]
+    async fn host_header_without_port_is_accepted() {
+        let log = EventLog::new();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, Arc::clone(&log)));
+
+        // curl on the default port sends `Host: localhost` with no port at
+        // all — the bound port is implied and the request must pass.
+        let mut socket = TcpStream::connect(addr).await.unwrap();
+        socket
+            .write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        socket.read_to_string(&mut response).await.unwrap();
+
+        assert!(response.contains("200 OK"), "{response}");
+    }
+
     #[tokio::test]
     async fn stream_sends_hello_snapshot_with_data_prefix() {
         let log = EventLog::new();
@@ -662,5 +759,102 @@ mod tests {
         assert!(hello.contains("200 OK"), "{hello}");
         assert!(hello.contains("data: {"), "{hello}");
         assert!(hello.contains("a.example.com"), "{hello}");
+    }
+
+    #[tokio::test]
+    async fn lagged_stream_catches_up_in_order_without_duplicates() {
+        let log = EventLog::new();
+        log.record_request(
+            "GET",
+            "a.example.com",
+            "/x",
+            Decision::Missed {
+                reason: "host not configured".into(),
+            },
+        );
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, Arc::clone(&log)));
+
+        let mut socket = TcpStream::connect(addr).await.unwrap();
+        socket
+            .write_all(
+                format!(
+                    "GET /stream HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+                    addr.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        // Read the hello (headers + the id 1 snapshot line).
+        let hello = read_until_marker(&mut socket, b"data: {").await;
+        assert!(hello.contains("a.example.com"), "{hello}");
+
+        // A burst of events while this test task holds the only thread: the
+        // stream handler cannot poll its receiver, the broadcast queue
+        // (capacity 256) overflows and the handler must take the Lagged
+        // catch-up path.
+        for i in 0..320 {
+            log.record_request(
+                "GET",
+                &format!("host-{i}.example.com"),
+                "/",
+                Decision::Missed {
+                    reason: "burst".into(),
+                },
+            );
+        }
+
+        // Read until the last event id shows up.
+        let tail = read_until_marker(&mut socket, br#""id":321,"#).await;
+        let raw = format!("{hello}{tail}");
+
+        let ids: Vec<u64> = raw
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|json| {
+                serde_json::from_str::<serde_json::Value>(json)
+                    .expect("every data line is a JSON event")["id"]
+                    .as_u64()
+                    .expect("event id is a number")
+            })
+            .collect();
+
+        // Hello id 1 first, the burst last: strictly increasing means no
+        // duplicates and no gaps — the lagged events all arrived exactly
+        // once.
+        assert_eq!(ids.len(), 321, "ids: {ids:?}");
+        assert_eq!(ids.first(), Some(&1), "ids: {ids:?}");
+        assert_eq!(ids.last(), Some(&321), "ids: {ids:?}");
+        assert!(
+            ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "ids must be strictly increasing: {ids:?}"
+        );
+    }
+
+    /// Read from the socket until `marker` shows up (or the stream ends),
+    /// bounded by a timeout — the SSE connection never closes on its own.
+    async fn read_until_marker(socket: &mut TcpStream, marker: &[u8]) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let n = socket.read(&mut chunk).await.expect("socket read");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(marker.len()).any(|w| w == marker) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("expected data must arrive within the timeout");
+
+        String::from_utf8_lossy(&buf).into_owned()
     }
 }
