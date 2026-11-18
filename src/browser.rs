@@ -111,8 +111,7 @@ impl Browser {
         pac_url: &str,
         browser_args: &[String],
     ) -> Result<Child, Box<dyn std::error::Error>> {
-        let profile = firefox_profile_dir();
-        std::fs::create_dir_all(&profile)?;
+        let profile = create_firefox_profile_dir()?;
 
         std::fs::write(profile.join("user.js"), firefox_user_js(pac_url))?;
 
@@ -155,20 +154,42 @@ fn isolates_profile(browser_args: &[String]) -> bool {
     browser_args.iter().any(|arg| arg.contains("user-data-dir"))
 }
 
-/// Temp directory for the throwaway Firefox profile. The pid+nanosecond
-/// suffix keeps the path unpredictable: certutil follows symlinks when it
-/// writes cert9.db into the directory, so a pre-planted path would be a
-/// plant-the-DB target — the same mitigation as the DER temp copy in
-/// trust.rs.
-fn firefox_profile_dir() -> PathBuf {
+/// Temp directory name of the throwaway Firefox profile for `nanos`/`attempt`.
+fn firefox_profile_name(nanos: u32, attempt: u32) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "rexy-firefox-profile-{}-{}-{}",
+        std::process::id(),
+        nanos,
+        attempt
+    ))
+}
+
+/// Create the throwaway Firefox profile directory. Exclusive create over a
+/// pid+nanosecond+attempt name: certutil follows symlinks when it writes
+/// cert9.db into the directory, so an existing (possibly planted) path must
+/// never be reused — `create_dir_all` would silently accept it.
+fn create_firefox_profile_dir() -> std::io::Result<PathBuf> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
 
-    std::env::temp_dir().join(format!(
-        "rexy-firefox-profile-{}-{nanos}",
-        std::process::id()
+    create_firefox_profile_dir_at(nanos)
+}
+
+fn create_firefox_profile_dir_at(nanos: u32) -> std::io::Result<PathBuf> {
+    for attempt in 0..4u32 {
+        let dir = firefox_profile_name(nanos, attempt);
+
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(std::io::Error::other(
+        "could not create a unique Firefox profile directory",
     ))
 }
 
@@ -343,7 +364,7 @@ mod tests {
     fn firefox_profile_dir_name_is_not_bare_pid() {
         // certutil follows symlinks into the profile directory: a
         // pid-only name would be a predictable plant-the-DB target.
-        let name = firefox_profile_dir()
+        let name = firefox_profile_name(754708000, 0)
             .file_name()
             .and_then(|name| name.to_str())
             .expect("profile dir has a file name")
@@ -352,8 +373,27 @@ mod tests {
 
         assert!(name.starts_with(&bare), "{name}");
         assert!(
-            name.len() > bare.len() && name[bare.len()..].starts_with('-'),
+            name.len() > bare.len(),
             "profile dir must carry a uniqueness suffix: {name}"
         );
+    }
+
+    #[test]
+    fn firefox_profile_creation_never_reuses_an_existing_dir() {
+        // Plant the directory the first attempt would produce: the exclusive
+        // create must move on to another name instead of reusing it
+        // (create_dir_all would silently accept the planted path).
+        let nanos = 42;
+        let planted = firefox_profile_name(nanos, 0);
+        std::fs::create_dir_all(&planted).unwrap();
+
+        let created = create_firefox_profile_dir_at(nanos).expect("a free name is found");
+
+        assert_ne!(created, planted, "a planted dir must not be reused");
+        assert!(created.is_dir(), "the created profile dir must exist");
+        assert!(planted.is_dir(), "the planted dir must stay untouched");
+
+        std::fs::remove_dir_all(&planted).ok();
+        std::fs::remove_dir_all(&created).ok();
     }
 }
