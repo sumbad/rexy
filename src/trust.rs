@@ -289,7 +289,8 @@ fn certutil_hint() -> &'static str {
 
     #[cfg(target_os = "windows")]
     {
-        return "certutil from NSS not found — install NSS tools (https://wiki.mozilla.org/NSS) and put certutil on PATH";
+        return "certutil from NSS not found — install NSS tools (https://wiki.mozilla.org/NSS) \
+                and put the NSS certutil on PATH; the built-in Windows certutil.exe will not work";
     }
 
     #[allow(unreachable_code)]
@@ -451,10 +452,20 @@ pub fn remove_firefox() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Name of the NSS `certutil` binary on this platform. On Windows the tool
+/// is `certutil.exe` — the bare name would never match a PATH entry.
+fn certutil_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "certutil.exe"
+    } else {
+        "certutil"
+    }
+}
+
 fn which_certutil() -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .map(|dir| dir.join("certutil"))
+        .map(|dir| dir.join(certutil_binary_name()))
         .find(|candidate| candidate.is_file())
 }
 
@@ -548,5 +559,16 @@ Path=/Users/me/FirefoxProfiles/work
             "user_pref(\"network.proxy.autoconfig_url\", \"http://127.0.0.1:59999/proxy.pac\");"
         ));
         assert!(user_js.contains("user_pref(\"network.http.http3.enable\", false);"));
+    }
+
+    #[test]
+    fn certutil_binary_name_carries_the_windows_extension() {
+        // PATH lookups on Windows match the file name including the
+        // extension: a bare "certutil" would never find certutil.exe.
+        if cfg!(windows) {
+            assert_eq!(certutil_binary_name(), "certutil.exe");
+        } else {
+            assert_eq!(certutil_binary_name(), "certutil");
+        }
     }
 }

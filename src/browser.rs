@@ -111,8 +111,7 @@ impl Browser {
         pac_url: &str,
         browser_args: &[String],
     ) -> Result<Child, Box<dyn std::error::Error>> {
-        let profile =
-            std::env::temp_dir().join(format!("rexy-firefox-profile-{}", std::process::id()));
+        let profile = firefox_profile_dir();
         std::fs::create_dir_all(&profile)?;
 
         std::fs::write(profile.join("user.js"), firefox_user_js(pac_url))?;
@@ -154,6 +153,23 @@ impl Browser {
 /// instance and the proxy flags are silently ignored.
 fn isolates_profile(browser_args: &[String]) -> bool {
     browser_args.iter().any(|arg| arg.contains("user-data-dir"))
+}
+
+/// Temp directory for the throwaway Firefox profile. The pid+nanosecond
+/// suffix keeps the path unpredictable: certutil follows symlinks when it
+/// writes cert9.db into the directory, so a pre-planted path would be a
+/// plant-the-DB target — the same mitigation as the DER temp copy in
+/// trust.rs.
+fn firefox_profile_dir() -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+
+    std::env::temp_dir().join(format!(
+        "rexy-firefox-profile-{}-{nanos}",
+        std::process::id()
+    ))
 }
 
 /// prefs.js content for the throwaway Firefox profile.
@@ -321,5 +337,23 @@ mod tests {
         ];
         assert!(!isolates_profile(&unrelated));
         assert!(!isolates_profile(&[]));
+    }
+
+    #[test]
+    fn firefox_profile_dir_name_is_not_bare_pid() {
+        // certutil follows symlinks into the profile directory: a
+        // pid-only name would be a predictable plant-the-DB target.
+        let name = firefox_profile_dir()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("profile dir has a file name")
+            .to_owned();
+        let bare = format!("rexy-firefox-profile-{}", std::process::id());
+
+        assert!(name.starts_with(&bare), "{name}");
+        assert!(
+            name.len() > bare.len() && name[bare.len()..].starts_with('-'),
+            "profile dir must carry a uniqueness suffix: {name}"
+        );
     }
 }
