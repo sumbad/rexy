@@ -471,8 +471,8 @@ fn certutil_binary_name() -> &'static str {
 /// lookup: the OS ships its own unrelated `certutil.exe` there, it is always
 /// on PATH, and CreateProcess resolves the bare `certutil` name to it even
 /// when the NSS tools come later — the NSS tool must be addressed by its
-/// resolved absolute path instead.
-#[cfg(windows)]
+/// resolved path instead.
+#[cfg(target_os = "windows")]
 fn windows_system_roots() -> Vec<std::path::PathBuf> {
     let root = std::env::var("SystemRoot")
         .or_else(|_| std::env::var("WINDIR"))
@@ -481,19 +481,32 @@ fn windows_system_roots() -> Vec<std::path::PathBuf> {
     vec![std::path::PathBuf::from(root)]
 }
 
-#[cfg(not(windows))]
+#[cfg(not(target_os = "windows"))]
 fn windows_system_roots() -> Vec<std::path::PathBuf> {
     Vec::new()
 }
 
-/// Whether `dir` lives under one of the system roots. Pure over the roots so
-/// tests can inject fake ones; Windows paths are case-insensitive.
-fn is_system_dir(dir: &std::path::Path, system_roots: &[std::path::PathBuf]) -> bool {
-    let dir = dir.to_string_lossy().to_ascii_lowercase();
+/// Case-folded component list of a path: comparison by components is immune
+/// to separator spellings (`C:/Windows` vs `C:\Windows`), and Windows paths
+/// are case-insensitive.
+fn folded_components(path: &std::path::Path) -> Vec<String> {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect()
+}
 
-    system_roots
-        .iter()
-        .any(|root| dir.starts_with(&root.to_string_lossy().to_ascii_lowercase()))
+/// Whether `dir` lives under one of the system roots. Pure over the roots so
+/// tests can inject fake ones. Components are compared case-folded, not raw
+/// string prefixes — a raw prefix match would miss separator spellings like
+/// `C:/Windows` and would wrongly match a name that merely shares the string
+/// prefix (`C:/WindowsX`).
+fn is_system_dir(dir: &std::path::Path, system_roots: &[std::path::PathBuf]) -> bool {
+    let dir = folded_components(dir);
+
+    system_roots.iter().any(|root| {
+        let root = folded_components(root);
+        dir.len() >= root.len() && root.iter().zip(&dir).all(|(r, d)| r == d)
+    })
 }
 
 /// Resolve the NSS `certutil` in the given PATH directories, skipping the
@@ -512,7 +525,8 @@ fn which_certutil_in(
         .find(|candidate| candidate.is_file())
 }
 
-/// The resolved absolute path of the NSS certutil, if present on PATH.
+/// The resolved path of the NSS certutil, if present on PATH — relative for
+/// relative PATH entries (those resolve against the CWD at spawn time).
 fn which_certutil() -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     let system_roots = windows_system_roots();
@@ -550,10 +564,10 @@ fn ca_der() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     Ok(tmp)
 }
 
-/// Run `program` with `args`. NSS invocations pass the resolved absolute
-/// path (see `which_certutil_in`); the OS-store tools (`security`, `pkexec`,
-/// the built-in Windows `certutil`) are addressed by their bare name on
-/// purpose — CreateProcess must pick the system one for them.
+/// Run `program` with `args`. NSS invocations pass the resolved path (see
+/// `which_certutil_in`); the OS-store tools (`security`, `pkexec`, the
+/// built-in Windows `certutil`) are addressed by their bare name on purpose —
+/// CreateProcess must pick the system one for them.
 fn run(program: &std::path::Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
     let status = std::process::Command::new(program).args(args).status()?;
 
@@ -649,7 +663,7 @@ Path=/Users/me/FirefoxProfiles/work
             None
         );
 
-        // The NSS directory is found and resolved to its absolute path.
+        // The NSS directory is found and resolved to its path.
         assert_eq!(
             which_certutil_in([nss_dir.clone()].into_iter(), &system_roots),
             Some(nss_dir.join(binary))
@@ -663,5 +677,28 @@ Path=/Users/me/FirefoxProfiles/work
         );
 
         std::fs::remove_dir_all(&base).ok();
+
+        // Separator spellings are normalized: components are compared
+        // case-folded, not raw string prefixes — forward-slash and mixed
+        // spellings of the system root still match, while a name that merely
+        // shares the string prefix does not.
+        let roots = vec![std::path::PathBuf::from("C:/Windows")];
+        assert!(is_system_dir(
+            std::path::Path::new("C:/Windows/System32"),
+            &roots
+        ));
+        assert!(is_system_dir(
+            std::path::Path::new("C:/Windows/System32/drivers"),
+            &roots
+        ));
+        assert!(is_system_dir(
+            std::path::Path::new("C:/windows/SYSTEM32"),
+            &roots
+        ));
+        assert!(!is_system_dir(
+            std::path::Path::new("C:/WindowsX/System32"),
+            &roots
+        ));
+        assert!(!is_system_dir(std::path::Path::new("C:/WindowsX"), &roots));
     }
 }
