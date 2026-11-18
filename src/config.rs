@@ -70,6 +70,12 @@ fn shadowed_pairs(rules: &[RedirectRule]) -> Vec<(usize, usize)> {
 
     for (later_idx, later) in rules.iter().enumerate() {
         for (earlier_idx, earlier) in rules.iter().enumerate().take(later_idx) {
+            // A passthrough rule (intercept = false) never rewrites traffic,
+            // so it cannot shadow anything: a later interceptable rule for
+            // the same paths still fires.
+            if !earlier.intercept() {
+                continue;
+            }
             if earlier.host() == later.host() && later.path().starts_with(earlier.path()) {
                 pairs.push((earlier_idx, later_idx));
             }
@@ -114,9 +120,9 @@ fn rule_from_file(
         .map(|raw| interpolate_field(raw, index, "csp_override"))
         .transpose()?;
 
-    validate_host(&host)?;
-    validate_path(&path)?;
-    validate_target(&target)?;
+    wrap_validation(validate_host(&host), "host", index)?;
+    wrap_validation(validate_path(&path), "path", index)?;
+    wrap_validation(validate_target(&target), "target", index)?;
 
     let csp_override = csp_override
         .map(|value| parse_csp_value(&value))
@@ -130,6 +136,16 @@ fn rule_from_file(
         rule.intercept,
         rule.embed,
     ))
+}
+
+/// Validation errors are useless without the rule and the field they belong
+/// to: a rules file with many entries must say which line to fix.
+fn wrap_validation(
+    result: Result<(), Box<dyn std::error::Error>>,
+    field: &str,
+    rule_index: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    result.map_err(|err| format!("rule #{} (field {field}): {err}", rule_index + 1).into())
 }
 
 /// Expand environment variable references in a rule field, after TOML parsing
@@ -499,6 +515,37 @@ target = "ftp://127.0.0.1:1111"
     }
 
     #[test]
+    fn validation_errors_name_the_rule_and_field() {
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "a.example.com"
+target = "ftp://127.0.0.1:1111"
+"#,
+        );
+
+        let err = load_rules(&path).unwrap_err().to_string();
+        assert!(err.contains("rule #1"), "{err}");
+        assert!(err.contains("field target"), "{err}");
+        assert!(err.contains("http:// or https://"), "{err}");
+
+        std::fs::remove_file(&path).ok();
+
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "https://a.example.com"
+target = "http://127.0.0.1:1111"
+"#,
+        );
+
+        let err = load_rules(&path).unwrap_err().to_string();
+        assert!(err.contains("rule #1 (field host)"), "{err}");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn rejects_invalid_csp_override() {
         let path = write_temp_config(
             r#"
@@ -533,6 +580,29 @@ csp_override = "frame-ancestors *\nX-Evil: y"
             true,
             false,
         )
+    }
+
+    fn passthrough_rule(host: &str, path: &str) -> RedirectRule {
+        RedirectRule::new(
+            host.into(),
+            path.into(),
+            "http://127.0.0.1:1111".into(),
+            None,
+            false,
+            false,
+        )
+    }
+
+    #[test]
+    fn passthrough_rule_does_not_shadow_later_rules() {
+        // The passthrough rule never rewrites anything, so a later
+        // interceptable rule for the same paths still fires — no warning.
+        let rules = vec![
+            passthrough_rule("app.example.com", "/"),
+            rule("app.example.com", "/api/"),
+        ];
+
+        assert!(shadowed_pairs(&rules).is_empty());
     }
 
     #[test]

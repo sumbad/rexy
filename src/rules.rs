@@ -161,7 +161,11 @@ pub fn check_url(rules: &[RedirectRule], url: &str) -> Result<CheckOutcome, Stri
     let (host, path) = split_url(url)?;
 
     let outcome = rules.iter().enumerate().find_map(|(index, rule)| {
-        rule.matches(&host, &path).then(|| CheckOutcome {
+        // WHY: same semantics as the proxy's request matching — an
+        // `intercept = false` rule tunnels the host without decryption and
+        // never rewrites plain-HTTP requests either, so it must not be
+        // reported as a match here.
+        (rule.intercept() && rule.matches(&host, &path)).then(|| CheckOutcome {
             url: url.to_string(),
             matched: true,
             rule_index: Some(index),
@@ -305,6 +309,32 @@ mod tests {
         assert!(check_url(&rules, "/api/v1/get").is_err());
         // Scheme is ignored: host + path decide, like in the proxy.
         assert!(check_url(&rules, "ftp://app.example.com/").is_ok());
+    }
+
+    #[test]
+    fn check_url_skips_passthrough_rules() {
+        let rules = vec![
+            RedirectRule::new(
+                "pinned.example.com".into(),
+                "/".into(),
+                "http://127.0.0.1:1111".into(),
+                None,
+                false,
+                false,
+            ),
+            rule("app.example.com", "/", "http://127.0.0.1:2222"),
+        ];
+
+        // intercept = false tunnels the host without decryption and never
+        // rewrites plain-HTTP requests either — the check must not report
+        // it as a match, exactly like the proxy's request matching.
+        let miss = check_url(&rules, "https://pinned.example.com/").unwrap();
+        assert!(!miss.matched);
+        assert_eq!(miss.rule_index, None);
+
+        let hit = check_url(&rules, "https://app.example.com/").unwrap();
+        assert!(hit.matched);
+        assert_eq!(hit.rule_index, Some(1));
     }
 
     #[test]

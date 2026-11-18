@@ -214,6 +214,9 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let route_all = std::env::var("REXY_PAC_ALL")
         .map(|v| v == "1")
         .unwrap_or(false);
+    if route_all {
+        tracing::warn!("PAC routes ALL hosts through the proxy (REXY_PAC_ALL=1)");
+    }
     let pac_content = pac::content(&pac_hosts, proxy_addr.port(), route_all);
     let shared_pac = std::sync::Arc::new(std::sync::RwLock::new(pac_content));
     tokio::spawn(pac::serve(pac_listener, std::sync::Arc::clone(&shared_pac)));
@@ -224,11 +227,25 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Status page: live rule decisions for humans (HTML/SSE) and harness
     // scripts (JSON). A busy port degrades to a warning, not a failure —
-    // the proxy itself does not depend on it.
-    let status_port: u16 = std::env::var("REXY_STATUS_PORT")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(8125);
+    // the proxy itself does not depend on it. `REXY_STATUS_PORT=off` turns
+    // the server off entirely.
+    let status_port: Option<u16> = match std::env::var("REXY_STATUS_PORT") {
+        Ok(value) if value.eq_ignore_ascii_case("off") => {
+            info!("status page disabled (REXY_STATUS_PORT=off)");
+            None
+        }
+        Ok(value) => match value.parse() {
+            Ok(port) => Some(port),
+            Err(_) => {
+                tracing::warn!(
+                    value = %value,
+                    "invalid REXY_STATUS_PORT; falling back to the default 8125"
+                );
+                Some(8125)
+            }
+        },
+        Err(_) => Some(8125),
+    };
 
     let fixtures = resolve_fixtures(&args)?;
 
@@ -242,21 +259,28 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             DevRedirect::with_fixtures(rules, Some(std::sync::Arc::new(recorder)), None)
         }
         Fixtures::Replay(replayer) => {
-            info!("replaying from fixtures; unmatched requests follow the rules");
+            info!(
+                har = %replayer.path().display(),
+                entries = replayer.entry_count(),
+                "replaying from fixtures; unmatched requests follow the rules"
+            );
             DevRedirect::with_fixtures(rules, None, Some(std::sync::Arc::new(replayer)))
         }
     };
 
-    let status_listener = match TcpListener::bind(("127.0.0.1", status_port)).await {
-        Ok(listener) => Some(listener),
-        Err(err) => {
-            tracing::warn!(
-                %err,
-                port = status_port,
-                "status page port is unavailable; running without it (set REXY_STATUS_PORT)"
-            );
-            None
-        }
+    let status_listener = match status_port {
+        Some(port) => match TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => Some(listener),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    port,
+                    "status page port is unavailable; running without it (set REXY_STATUS_PORT)"
+                );
+                None
+            }
+        },
+        None => None,
     };
 
     if let Some(status_listener) = status_listener {
@@ -573,6 +597,9 @@ fn init_logging() {
         .with_env_filter(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "rexy=info,hudsucker=info".into()),
         )
+        // stderr, not stdout: `rules check --json` and other machine-readable
+        // output must stay unpolluted by shadow-warnings and other logs.
+        .with_writer(std::io::stderr)
         .init();
 }
 

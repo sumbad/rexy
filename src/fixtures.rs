@@ -338,6 +338,8 @@ fn iso8601_millis(epoch_ms: i64) -> String {
 /// do not break the replay. Unmatched requests fall through to the usual
 /// rules.
 pub struct Replayer {
+    path: PathBuf,
+    entry_count: usize,
     entries: Mutex<HashMap<(String, String), HarResponse>>,
     no_query: Mutex<HashMap<(String, String), HarResponse>>,
 }
@@ -354,6 +356,7 @@ impl Replayer {
             .map_err(|err| format!("failed to read HAR file {}: {err}", path.display()))?;
         let har = Har::from_str(&raw)?;
 
+        let entry_count = har.log.entries.len();
         let mut exact = HashMap::new();
         let mut no_query = HashMap::new();
 
@@ -385,9 +388,21 @@ impl Replayer {
         }
 
         Ok(Self {
+            entry_count,
+            path: path.to_path_buf(),
             entries: Mutex::new(exact),
             no_query: Mutex::new(no_query),
         })
+    }
+
+    /// The HAR file this session replays from (startup logging).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Number of entries loaded from the HAR file (startup logging).
+    pub fn entry_count(&self) -> usize {
+        self.entry_count
     }
 
     pub fn lookup(&self, method: &str, url: &str) -> Option<HarResponse> {
