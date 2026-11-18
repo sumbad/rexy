@@ -436,18 +436,24 @@ async fn handle(mut socket: TcpStream, log: Arc<EventLog>, bound_port: u16) -> s
                         // Missed notifications. The ids the receiver still
                         // retains are drained here (try_recv consumes them,
                         // so recv() would never re-deliver them) and re-sent
-                        // below, after the older catch-up ids — the retained
-                        // ones are the newest, so the client still sees ids
-                        // in ascending order.
+                        // below, after the older catch-up ids from the ring.
+                        //
+                        // Guarantees for new events: no losses (the ring
+                        // covers whatever a nested lag dropped mid-drain) and
+                        // no duplicates — but ids ascend only in the common
+                        // case. When a burst races the drain, a nested lag
+                        // can drop a middle-of-queue id that the ring then
+                        // delivers ahead of the retained tail; that is fine,
+                        // because the client page keys its rows by id and
+                        // updates them in place — every case above is at
+                        // worst an idempotent re-render.
                         //
                         // The ring loop is bounded by the newest retained id:
                         // an event recorded after the drain is newer still and
                         // reaches this client through recv() in order —
-                        // sending it from the snapshot here would break the
-                        // ordering and duplicate it later. In-place response
-                        // updates re-notify an old id on purpose; the client
-                        // page keys its rows by id, so a repeated id is at
-                        // worst an idempotent re-render.
+                        // sending it from the snapshot here would duplicate it
+                        // later. In-place response updates re-notify an old id
+                        // on purpose.
                         let mut retained = Vec::new();
                         loop {
                             match receiver.try_recv() {
