@@ -32,7 +32,10 @@ pub struct HarContent {
     pub size: usize,
     #[serde(rename = "mimeType")]
     pub mime_type: String,
-    pub text: String,
+    /// HAR 1.2 makes `content.text` optional — Chrome DevTools exports of
+    /// 304/redirect responses omit it. Absent text replays as an empty body.
+    #[serde(default)]
+    pub text: Option<String>,
     pub encoding: Option<String>,
 }
 
@@ -45,7 +48,11 @@ pub struct HarResponse {
     pub http_version: String,
     pub headers: Vec<HarHeader>,
     pub content: HarContent,
+    // HAR 1.2 spells these camelCase; the alias keeps HAR files recorded by
+    // older rexy versions (snake_case) readable.
+    #[serde(rename = "headersSize", alias = "headers_size")]
     pub headers_size: i64,
+    #[serde(rename = "bodySize", alias = "body_size")]
     pub body_size: i64,
 }
 
@@ -189,7 +196,7 @@ impl Recorder {
                 content: HarContent {
                     size: body.len(),
                     mime_type: String::new(),
-                    text: base64::engine::general_purpose::STANDARD.encode(body),
+                    text: Some(base64::engine::general_purpose::STANDARD.encode(body)),
                     encoding: Some("base64".into()),
                 },
                 headers_size: -1,
@@ -266,13 +273,29 @@ impl Replayer {
         let mut no_query = HashMap::new();
 
         for entry in har.log.entries {
+            // An external HAR may carry a malformed base64 body; decoding it
+            // lazily produced an empty body with the recorded headers (a
+            // content-length that describes bytes that never arrive). Fail
+            // at startup instead, naming the entry.
+            if entry.response.content.encoding.as_deref() == Some("base64") {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode(entry.response.content.text.as_deref().unwrap_or_default())
+                    .map_err(|err| {
+                        format!(
+                            "entry {} (status {}): response body is not valid base64: {err}",
+                            entry.request.url, entry.response.status
+                        )
+                    })?;
+            }
+
             let key = (
                 entry.request.method.to_ascii_uppercase(),
                 entry.request.url.clone(),
             );
-            no_query
-                .entry((key.0.clone(), strip_query(&key.1)))
-                .or_insert(entry.response.clone());
+            // Last wins for both maps: the last recorded exchange for a URL
+            // is the freshest one, so both lookups must agree on it.
+            no_query.insert((key.0.clone(), strip_query(&key.1)), entry.response.clone());
             exact.insert(key, entry.response);
         }
 
@@ -355,7 +378,7 @@ mod tests {
             .lookup("GET", "https://a.example.com/api/x?v=999")
             .expect("query-free URL must hit");
         assert_eq!(hit.status, 200);
-        assert_eq!(hit.content.text, "Y29uc29sZS5sb2coMSk=");
+        assert_eq!(hit.content.text.as_deref(), Some("Y29uc29sZS5sb2coMSk="));
 
         // Different URL or method misses.
         assert!(
@@ -370,6 +393,124 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recorded_exchange_keeps_request_method() {
+        let dir = std::env::temp_dir().join(format!("rexy-har-post-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let recorder = Recorder::start(&dir).unwrap();
+        recorder.record(
+            "POST",
+            "https://a.example.com/api/submit",
+            vec![],
+            201,
+            vec![],
+            b"created",
+            5,
+        );
+
+        let replayer = Replayer::open(&dir.join("rexy-session.har")).unwrap();
+
+        let hit = replayer
+            .lookup("POST", "https://a.example.com/api/submit")
+            .expect("recorded POST must replay under POST");
+        assert_eq!(hit.status, 201);
+
+        // The method is part of the key: a GET with the same URL must not
+        // return the POST exchange.
+        assert!(
+            replayer
+                .lookup("GET", "https://a.example.com/api/submit")
+                .is_none()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn duplicate_entries_last_body_wins_for_both_lookups() {
+        let dir = std::env::temp_dir().join(format!("rexy-har-dedup-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let recorder = Recorder::start(&dir).unwrap();
+        recorder.record(
+            "GET",
+            "https://a.example.com/api/x?v=1",
+            vec![],
+            200,
+            vec![],
+            b"first",
+            1,
+        );
+        recorder.record(
+            "GET",
+            "https://a.example.com/api/x?v=1",
+            vec![],
+            200,
+            vec![],
+            b"second",
+            1,
+        );
+
+        let replayer = Replayer::open(&dir.join("rexy-session.har")).unwrap();
+
+        // Two exchanges for the same URL: the last recorded body wins for
+        // the exact and the query-free lookup alike.
+        let exact = replayer
+            .lookup("GET", "https://a.example.com/api/x?v=1")
+            .expect("exact lookup must hit");
+        assert_eq!(
+            exact.content.text.as_deref().map(str::to_owned),
+            Some(base64_of(b"second"))
+        );
+
+        let query_free = replayer
+            .lookup("GET", "https://a.example.com/api/x")
+            .expect("query-free lookup must hit");
+        assert_eq!(
+            query_free.content.text.as_deref().map(str::to_owned),
+            Some(base64_of(b"second"))
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn base64_of(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn invalid_base64_body_is_a_load_error() {
+        let path = std::env::temp_dir().join(format!("rexy-har-b64-{}.har", std::process::id()));
+        let raw = r#"{"log":{"version":"1.2","creator":{"name":"x","version":"1"},"entries":[{"startedDateTime":"2026-01-01T00:00:00.000Z","time":0,"request":{"method":"GET","url":"https://a.example.com/x","httpVersion":"HTTP/1.1","headers":[],"queryString":[],"cookies":[],"headersSize":-1,"bodySize":-1},"response":{"status":200,"statusText":"","httpVersion":"HTTP/1.1","headers":[],"content":{"size":4,"mimeType":"text/plain","text":"!!!not-base64!!!","encoding":"base64"},"headersSize":-1,"bodySize":4}}]}}"#;
+        std::fs::write(&path, raw).unwrap();
+
+        let err = Replayer::open(&path).unwrap_err();
+        assert!(err.contains("https://a.example.com/x"), "{err}");
+        assert!(err.contains("base64"), "{err}");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn har_without_content_text_parses() {
+        // Chrome DevTools exports of 304/redirect responses omit
+        // content.text — the file must still load.
+        let path = std::env::temp_dir().join(format!("rexy-har-notext-{}.har", std::process::id()));
+        let raw = r#"{"log":{"version":"1.2","creator":{"name":"x","version":"1"},"entries":[{"startedDateTime":"2026-01-01T00:00:00.000Z","time":0,"request":{"method":"GET","url":"https://a.example.com/x","httpVersion":"HTTP/1.1","headers":[],"queryString":[],"cookies":[],"headersSize":-1,"bodySize":-1},"response":{"status":304,"statusText":"Not Modified","httpVersion":"HTTP/1.1","headers":[],"content":{"size":0,"mimeType":"text/html"},"headersSize":-1,"bodySize":0}}]}}"#;
+        std::fs::write(&path, raw).unwrap();
+
+        let replayer = Replayer::open(&path).unwrap();
+        let hit = replayer
+            .lookup("GET", "https://a.example.com/x")
+            .expect("entry without content.text must load");
+        assert_eq!(hit.status, 304);
+        assert_eq!(hit.content.text, None);
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

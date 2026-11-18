@@ -5,7 +5,7 @@ use crate::rules::{CspOverride, RedirectRule, local_target_host};
 use crate::status::{Decision, EventLog, now_ms};
 use hudsucker::{
     Body, HttpContext, HttpHandler, RequestOrResponse,
-    hyper::{HeaderMap, Request, Response, header},
+    hyper::{HeaderMap, Request, Response, body::Bytes, header},
 };
 
 /// Replace or remove every `Content-Security-Policy` header.
@@ -83,6 +83,20 @@ fn strip_embed_blockers(headers: &mut HeaderMap) {
     }
 }
 
+/// Remove the headers that describe a body when the actual body could not be
+/// delivered: on a buffering failure the client gets an empty body, and stale
+/// `Content-Length`/`Content-Encoding`/`Transfer-Encoding` would make it wait
+/// for (or misdecode) bytes that never arrive.
+fn strip_stale_body_headers(headers: &mut HeaderMap) {
+    for name in [
+        header::CONTENT_LENGTH,
+        header::CONTENT_ENCODING,
+        header::TRANSFER_ENCODING,
+    ] {
+        headers.remove(name);
+    }
+}
+
 /// What to do to the response of the current request: CSP override from the
 /// matched rule plus whether the rule asked to shed embedding blockers.
 #[derive(Clone, Debug, Default)]
@@ -116,10 +130,11 @@ struct Pending {
     edits: ResponseEdits,
 }
 
-/// Per-request metadata for the recording phase: the original prod URL and
-/// request headers, captured before any rewrite.
+/// Per-request metadata for the recording phase: the request method, the
+/// original prod URL and request headers, captured before any rewrite.
 #[derive(Clone, Debug)]
 struct RecordMeta {
+    method: String,
     url: String,
     headers: Vec<HarHeader>,
     started_ms: u128,
@@ -201,12 +216,13 @@ impl DevRedirect {
             }
         }
 
+        let text = recorded.content.text.as_deref().unwrap_or_default();
         let body = if recorded.content.encoding.as_deref() == Some("base64") {
             base64::engine::general_purpose::STANDARD
-                .decode(&recorded.content.text)
+                .decode(text)
                 .unwrap_or_default()
         } else {
-            recorded.content.text.clone().into_bytes()
+            text.as_bytes().to_vec()
         };
 
         tracing::info!(%url, status = recorded.status, "replaying response from fixtures");
@@ -220,6 +236,7 @@ impl DevRedirect {
 
     fn record_meta(req: &Request<Body>) -> Option<RecordMeta> {
         Some(RecordMeta {
+            method: req.method().to_string(),
             url: original_url(req),
             headers: headers_to_har(req.headers()),
             started_ms: std::time::SystemTime::now()
@@ -412,10 +429,10 @@ impl DevRedirect {
 
         // Map Local: a `file:` target serves static files directly instead of
         // redirecting to a dev server. The response is built here, so its
-        // response edits and outcome are recorded here too —
+        // response edits, outcome and HAR entry are recorded here too —
         // `handle_response` never sees it.
         if rule.is_file_target() {
-            let mut res = serve_from_file_target(&rule, &req);
+            let (mut res, file_body) = serve_from_file_target(&rule, &req);
             let edits = ResponseEdits::from_rule(&rule);
 
             if let Some(csp_override) = &edits.csp_override {
@@ -435,6 +452,21 @@ impl DevRedirect {
                 res.status().as_u16(),
                 now_ms().saturating_sub(started_ms),
             );
+
+            // File-target answers must land in the HAR too, or a replay of
+            // the session would lose every Map Local response. A HEAD answer
+            // records an empty body — the client never received one either.
+            if let Some(recorder) = self.recorder.as_ref() {
+                recorder.record(
+                    &method,
+                    &original_url(&req),
+                    headers_to_har(req.headers()),
+                    res.status().as_u16(),
+                    headers_to_har(res.headers()),
+                    &file_body,
+                    now_ms().saturating_sub(started_ms) as i64,
+                );
+            }
 
             return RequestOrResponse::Response(res);
         }
@@ -531,17 +563,20 @@ impl DevRedirect {
     ) -> Response<Body> {
         use http_body_util::BodyExt;
 
-        let (parts, body) = res.into_parts();
+        let (mut parts, body) = res.into_parts();
         let bytes = match body.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(err) => {
                 tracing::warn!(%err, url = %meta.url, "failed to buffer response for recording");
+                // The client gets an empty body now; the stale length and
+                // encoding headers would describe bytes that never arrive.
+                strip_stale_body_headers(&mut parts.headers);
                 return Response::from_parts(parts, Body::empty());
             }
         };
 
         recorder.record(
-            "GET",
+            &meta.method,
             &meta.url,
             meta.headers,
             parts.status.as_u16(),
@@ -616,20 +651,28 @@ fn percent_decode(input: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-fn plain_response(status: hudsucker::hyper::StatusCode, body: &str) -> Response<Body> {
-    Response::builder()
+/// Static text response plus the exact bytes it carries, so the exchange can
+/// be recorded into the HAR without re-buffering the body.
+fn plain_response(status: hudsucker::hyper::StatusCode, body: &str) -> (Response<Body>, Bytes) {
+    let bytes = Bytes::from(body.to_owned());
+    let res = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .header(header::CONTENT_LENGTH, body.len())
-        .body(Body::from(body.to_string()))
-        .expect("static response with fixed parts always builds")
+        .body(Body::from(bytes.clone()))
+        .expect("static response with fixed parts always builds");
+
+    (res, bytes)
 }
 
 /// Map Local: serve a request from the `file:<dir>` target's directory by the
 /// requested path — the cheap way to put local assets on top of prod without
 /// a dev server. `..` segments and symlink escapes are rejected; directories
 /// are not listed; the query string is not part of the lookup.
-fn serve_from_file_target(rule: &RedirectRule, req: &Request<Body>) -> Response<Body> {
+///
+/// Returns the response and the exact body bytes it carries (empty for HEAD
+/// and error answers), so the caller can record the exchange into the HAR.
+fn serve_from_file_target(rule: &RedirectRule, req: &Request<Body>) -> (Response<Body>, Bytes) {
     use hudsucker::hyper::{Method, StatusCode};
     use std::path::PathBuf;
 
@@ -687,17 +730,21 @@ fn serve_from_file_target(rule: &RedirectRule, req: &Request<Body>) -> Response<
         "serving file from file target"
     );
 
+    let bytes = Bytes::from(bytes);
     let builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime_type(&canonical))
         .header(header::CONTENT_LENGTH, bytes.len());
 
-    if head {
+    let recorded = if head { Bytes::new() } else { bytes.clone() };
+    let res = if head {
         builder.body(Body::empty())
     } else {
         builder.body(Body::from(bytes))
     }
-    .expect("static response with fixed parts always builds")
+    .expect("static response with fixed parts always builds");
+
+    (res, recorded)
 }
 
 #[cfg(test)]
@@ -1378,5 +1425,202 @@ mod tests {
         assert!(h.matches_any_host("example.com"));
         assert!(h.matches_any_host("other.com"));
         assert!(!h.matches_any_host("third.com"));
+    }
+
+    // ---- record/replay ----
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rexy-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    #[tokio::test]
+    async fn recorded_exchange_keeps_request_method_and_body() {
+        use http_body_util::BodyExt;
+
+        let record_dir = temp_dir("rec-method");
+        let recorder = std::sync::Arc::new(Recorder::start(&record_dir).unwrap());
+        let mut h = DevRedirect::with_fixtures(
+            vec![RedirectRule::new(
+                "example.com".into(),
+                "/".into(),
+                "http://127.0.0.1:5173".into(),
+                None,
+                true,
+                false,
+            )],
+            Some(std::sync::Arc::clone(&recorder)),
+            None,
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://example.com/api/submit")
+            .header(header::HOST, "example.com")
+            .body(Body::empty())
+            .unwrap();
+        let _ = h.handle_request_inner(req);
+
+        let res = h
+            .handle_response_inner(
+                Response::builder()
+                    .status(201)
+                    .body(Body::from("created"))
+                    .unwrap(),
+            )
+            .await;
+
+        // The client still receives the full body through the recording path.
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"created");
+
+        let replayer = Replayer::open(&record_dir.join("rexy-session.har")).unwrap();
+        assert!(
+            replayer
+                .lookup("POST", "https://example.com/api/submit")
+                .is_some(),
+            "recorded POST must replay under POST"
+        );
+        assert!(
+            replayer
+                .lookup("GET", "https://example.com/api/submit")
+                .is_none(),
+            "method must not be dropped from the HAR"
+        );
+
+        std::fs::remove_dir_all(&record_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn buffering_failure_strips_body_describing_headers() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        // A body whose single frame is an error: emulates an upstream that
+        // dies mid-response while recording is active.
+        struct FailingBody;
+
+        impl hudsucker::hyper::body::Body for FailingBody {
+            type Data = hudsucker::hyper::body::Bytes;
+            type Error = hudsucker::Error;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<hudsucker::hyper::body::Frame<Self::Data>, Self::Error>>>
+            {
+                Poll::Ready(Some(Err(hudsucker::Error::Unknown)))
+            }
+        }
+
+        let record_dir = temp_dir("rec-fail");
+        let mut h = DevRedirect::with_fixtures(
+            vec![RedirectRule::new(
+                "example.com".into(),
+                "/".into(),
+                "http://127.0.0.1:5173".into(),
+                None,
+                true,
+                false,
+            )],
+            Some(std::sync::Arc::new(Recorder::start(&record_dir).unwrap())),
+            None,
+        );
+
+        let _ = h.handle_request_inner(request_to("example.com", "/stream"));
+
+        let res = Response::builder()
+            .status(200)
+            .header(header::CONTENT_LENGTH, "42")
+            .header(header::CONTENT_ENCODING, "gzip")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(hudsucker::Body::from(
+                http_body_util::combinators::BoxBody::new(FailingBody),
+            ))
+            .unwrap();
+
+        let res = h.handle_response_inner(res).await;
+
+        // The client gets an empty body: no stale length/encoding headers.
+        assert!(!res.headers().contains_key(header::CONTENT_LENGTH));
+        assert!(!res.headers().contains_key(header::CONTENT_ENCODING));
+        assert!(!res.headers().contains_key(header::TRANSFER_ENCODING));
+        // Unrelated headers survive.
+        assert_eq!(res.headers()[header::CONTENT_TYPE], "text/plain");
+
+        std::fs::remove_dir_all(&record_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn file_target_exchange_is_recorded_into_har() {
+        let dir = temp_dir("rec-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("app.js"), b"console.log(1)").unwrap();
+
+        let record_dir = temp_dir("rec-file-har");
+        let recorder = std::sync::Arc::new(Recorder::start(&record_dir).unwrap());
+        let mut h = DevRedirect::with_fixtures(
+            vec![file_rule(&dir)],
+            Some(std::sync::Arc::clone(&recorder)),
+            None,
+        );
+
+        let res = as_response(h.handle_request_inner(file_request("/app.js")));
+        assert_eq!(res.status(), 200);
+
+        let head_req = Request::builder()
+            .method("HEAD")
+            .uri("https://assets.example.com/app.js")
+            .header(header::HOST, "assets.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let res = as_response(h.handle_request_inner(head_req));
+        assert_eq!(res.status(), 200);
+
+        let replayer = Replayer::open(&record_dir.join("rexy-session.har")).unwrap();
+        // GET and HEAD are separate entries: the GET one carries the file
+        // bytes, HEAD records an empty body.
+        let get = replayer
+            .lookup("GET", "https://assets.example.com/app.js")
+            .expect("file-target GET must be recorded");
+        assert_eq!(get.status, 200);
+        assert_eq!(get.content.size, 14);
+
+        let head = replayer
+            .lookup("HEAD", "https://assets.example.com/app.js")
+            .expect("file-target HEAD must be recorded");
+        assert_eq!(head.content.size, 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&record_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn replay_of_entry_without_content_text_returns_empty_body() {
+        use http_body_util::BodyExt;
+
+        let dir = temp_dir("replay-notext");
+        std::fs::create_dir_all(&dir).unwrap();
+        let har_path = dir.join("session.har");
+        // Chrome DevTools export of a 304: the response content carries no
+        // `text` field.
+        let raw = r#"{"log":{"version":"1.2","creator":{"name":"x","version":"1"},"entries":[{"startedDateTime":"2026-01-01T00:00:00.000Z","time":0,"request":{"method":"GET","url":"https://a.example.com/x","httpVersion":"HTTP/1.1","headers":[],"queryString":[],"cookies":[],"headersSize":-1,"bodySize":-1},"response":{"status":304,"statusText":"Not Modified","httpVersion":"HTTP/1.1","headers":[],"content":{"size":0,"mimeType":"text/html"},"headersSize":-1,"bodySize":0}}]}}"#;
+        std::fs::write(&har_path, raw).unwrap();
+
+        let replayer = Replayer::open(&har_path).unwrap();
+        let mut h = DevRedirect::with_fixtures(vec![], None, Some(std::sync::Arc::new(replayer)));
+
+        let outcome = h.handle_request_inner(request_to("a.example.com", "/x"));
+        let res = match outcome {
+            RequestOrResponse::Response(res) => res,
+            RequestOrResponse::Request(_) => panic!("replay must answer with a response"),
+        };
+
+        assert_eq!(res.status(), 304);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert!(bytes.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
