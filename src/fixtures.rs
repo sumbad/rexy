@@ -13,7 +13,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -48,7 +48,7 @@ pub struct HarResponse {
     pub http_version: String,
     pub headers: Vec<HarHeader>,
     pub content: HarContent,
-    // HAR 1.2 spells these camelCase; the alias keeps HAR files recorded by
+    // HAR 1.2 spell these camelCase; the alias keeps HAR files recorded by
     // older rexy versions (snake_case) readable.
     #[serde(rename = "headersSize", alias = "headers_size")]
     pub headers_size: i64,
@@ -123,17 +123,34 @@ impl Har {
         Ok(har)
     }
 
+    /// Compact JSON: the file is rewritten wholesale on every flush, pretty
+    /// printing would multiply the bytes written per session for no benefit
+    /// (the file still opens in Chrome DevTools / mitmproxy).
     fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".into())
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".into())
     }
 }
 
 // ---------- recording ----------
 
-/// Accumulates entries during `--record <dir>` and rewrites the HAR file on
-/// every completed exchange — a hard kill loses at most the exchange in
-/// flight.
+/// Flush every exchange while the session is small, then every 25th one.
+/// WHY: the whole session is re-serialized and rewritten per flush — O(N²)
+/// bytes over a long session; a small session stays fully fresh for
+/// inspection, a long one trades a few lost exchanges for not stalling
+/// the disk on every response.
+const ALWAYS_WRITE_ENTRIES: usize = 100;
+const WRITE_EVERY_NTH: usize = 25;
+
+/// Accumulates entries during `--record <dir>` and rewrites the HAR file as
+/// exchanges complete. Flushes run off the response path (spawn_blocking)
+/// and are throttled (see the constants above), so a hard kill may lose the
+/// last few exchanges — the file on disk is always a valid (if slightly
+/// stale) HAR.
 pub struct Recorder {
+    state: Arc<RecorderState>,
+}
+
+struct RecorderState {
     path: PathBuf,
     har: Mutex<Har>,
 }
@@ -141,7 +158,7 @@ pub struct Recorder {
 impl std::fmt::Debug for Recorder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Recorder")
-            .field("path", &self.path)
+            .field("path", &self.state.path)
             .finish()
     }
 }
@@ -152,8 +169,10 @@ impl Recorder {
             .map_err(|err| format!("failed to create record dir {}: {err}", dir.display()))?;
 
         Ok(Self {
-            path: dir.join("rexy-session.har"),
-            har: Mutex::new(Har::empty()),
+            state: Arc::new(RecorderState {
+                path: dir.join("rexy-session.har"),
+                har: Mutex::new(Har::empty()),
+            }),
         })
     }
 
@@ -204,17 +223,83 @@ impl Recorder {
             },
         };
 
-        let mut har = self.har.lock().expect("recorder lock");
-        har.log.entries.push(entry);
+        let write = {
+            let mut har = self.state.har.lock().expect("recorder lock");
+            har.log.entries.push(entry);
+            let count = har.log.entries.len();
+            count <= ALWAYS_WRITE_ENTRIES || count.is_multiple_of(WRITE_EVERY_NTH)
+        };
 
-        if let Err(err) = std::fs::write(&self.path, har.to_json()) {
-            tracing::warn!(%err, path = %self.path.display(), "failed to write HAR file");
+        if write {
+            self.spawn_flush();
         }
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// Serialize the current session and rewrite the HAR file without
+    /// blocking the caller: the whole-session write is O(session size) and
+    /// used to run inline on the async response path, stalling the worker.
+    /// The task re-locks the recorder state, so concurrent flushes can never
+    /// write an older snapshot over a newer one.
+    fn spawn_flush(&self) {
+        let state = Arc::clone(&self.state);
+
+        let flush = move || {
+            if let Err(err) = flush_state(&state) {
+                tracing::warn!(%err, path = %state.path.display(), "failed to write HAR file");
+            }
+        };
+
+        match tokio::runtime::Handle::try_current() {
+            // Inside a runtime (the proxy): the write must not stall the
+            // async response worker.
+            Ok(handle) => {
+                handle.spawn_blocking(flush);
+            }
+            // No runtime (tests, tooling): a plain thread keeps the same
+            // off-caller-path guarantee.
+            Err(_) => {
+                std::thread::spawn(flush);
+            }
+        }
     }
+
+    /// Synchronously write the current session, for tests that read the file
+    /// right after recording; the regular paths are `spawn_flush` and the
+    /// shutdown flush in `Drop`.
+    #[cfg(test)]
+    pub fn flush(&self) -> std::io::Result<()> {
+        flush_state(&self.state)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.state.path
+    }
+}
+
+impl Drop for Recorder {
+    /// Final synchronous flush: with the throttled background flushes, a
+    /// graceful shutdown must still land every recorded exchange on disk
+    /// (only a hard kill can lose the last few).
+    fn drop(&mut self) {
+        if let Err(err) = flush_state(&self.state) {
+            tracing::warn!(%err, path = %self.state.path.display(), "failed to write HAR file");
+        }
+    }
+}
+
+/// Serialize the whole session and replace the HAR file. The recorder mutex
+/// is held across the write, so flushes from concurrent tasks are serialized
+/// (a slower flush can never overwrite a newer snapshot) and the temp-file
+/// name cannot collide. The file is written to a sibling temp path and
+/// renamed into place: a reader (Chrome DevTools, tests) always observes a
+/// complete HAR, never a half-written file.
+fn flush_state(state: &RecorderState) -> std::io::Result<()> {
+    let har = state.har.lock().expect("recorder lock");
+    let tmp = state
+        .path
+        .with_extension(format!("har.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, har.to_json())?;
+    std::fs::rename(tmp, &state.path)
 }
 
 /// RFC 3339 timestamp from epoch milliseconds (no external time crates: HAR
@@ -351,6 +436,9 @@ mod tests {
             sample_body(),
             12,
         );
+        // The regular flush runs on a background thread; force it so the
+        // file is complete when this returns.
+        recorder.flush().unwrap();
     }
 
     #[test]
@@ -362,7 +450,7 @@ mod tests {
         let har_path = dir.join("rexy-session.har");
         let raw = std::fs::read_to_string(&har_path).unwrap();
         // HAR 1.2 marker and base64 body survive the round trip.
-        assert!(raw.contains(r#""version": "1.2""#));
+        assert!(raw.contains(r#""version":"1.2""#));
         assert!(raw.contains("Y29uc29sZS5sb2coMSk=")); // base64(sample_body())
 
         let replayer = Replayer::open(&har_path).unwrap();
@@ -410,6 +498,7 @@ mod tests {
             b"created",
             5,
         );
+        recorder.flush().unwrap();
 
         let replayer = Replayer::open(&dir.join("rexy-session.har")).unwrap();
 
@@ -453,6 +542,7 @@ mod tests {
             b"second",
             1,
         );
+        recorder.flush().unwrap();
 
         let replayer = Replayer::open(&dir.join("rexy-session.har")).unwrap();
 

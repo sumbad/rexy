@@ -590,7 +590,8 @@ impl DevRedirect {
                 .max(0),
         );
 
-        Response::from_parts(parts, Body::from(bytes.to_vec()))
+        // `Bytes` is cheap to clone — no need to copy into a Vec.
+        Response::from_parts(parts, Body::from(bytes))
     }
 }
 
@@ -1475,6 +1476,8 @@ mod tests {
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], b"created");
 
+        recorder.flush().unwrap();
+
         let replayer = Replayer::open(&record_dir.join("rexy-session.har")).unwrap();
         assert!(
             replayer
@@ -1577,6 +1580,8 @@ mod tests {
             .unwrap();
         let res = as_response(h.handle_request_inner(head_req));
         assert_eq!(res.status(), 200);
+
+        recorder.flush().unwrap();
 
         let replayer = Replayer::open(&record_dir.join("rexy-session.har")).unwrap();
         // GET and HEAD are separate entries: the GET one carries the file
