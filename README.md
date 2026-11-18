@@ -113,7 +113,9 @@ rexy clean --firefox    # remove it again
 
 When rexy launches Firefox itself (`--browser firefox`), it imports the CA into the throwaway
 session profile automatically (via the same `certutil`); without `certutil` on PATH rexy logs a
-warning and the profile stays untrusted.
+warning and the profile stays untrusted. Note for Windows: the required `certutil` is the one
+from [NSS tools](https://wiki.mozilla.org/NSS) — the built-in Windows `certutil.exe` (System32)
+will not work.
 
 ## Usage
 
@@ -201,6 +203,9 @@ rexy run -f rules.toml
 - `--file` cannot be combined with `--host`, `--path`, `--target` or `--csp-override` — those configure a single rule.
 - `--browser`, `--proxy-port` and browser arguments after `--` stay on the command line.
 - The first matching rule wins (host + path prefix).
+- `host` may contain ASCII letters, digits, dots, dashes and underscores (punycode `xn--` labels
+  are fine — underscores are common in internal DNS); IPv6 literals are not supported. Matching
+  is exact-host (normalized: lowercased, port stripped), no subdomains.
 - `intercept = false` tunnels the host as a CONNECT passthrough: rexy never decrypts or rewrites
   it — the escape hatch for pinned clients and MITM-unfriendly WAFs. `rexy rules check` skips
   such rules too, and they never trigger the shadowing warning.
@@ -328,6 +333,8 @@ rexy run --replay /tmp/smoke-1/rexy-session.har -f rules.toml --browser chromium
   applied to replayed responses: the recording is served exactly as captured.
 - Recording buffers response bodies — the whole session (bodies included) stays in memory while
   rexy runs, so streaming responses (SSE, long-poll) are not suitable for recording.
+- The HAR file is flushed continuously while the session is small and every 25th exchange after
+  that; Ctrl+C always writes the complete session, a hard kill can lose the last few exchanges.
 - Recording covers every request that reaches the proxy on intercepted hosts — redirected to a
   target, served from a `file:` target, or passing through within those hosts. Traffic rexy never
   sees (PAC `DIRECT`) is not recorded, so offline replay works for the intercepted hosts, not for
