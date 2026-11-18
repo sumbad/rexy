@@ -344,6 +344,14 @@ async fn handle(mut socket: TcpStream, log: Arc<EventLog>) -> std::io::Result<()
                 )
                 .await?;
 
+            // Subscribe BEFORE the snapshot: an event recorded between the
+            // snapshot and a later subscribe would be in neither — the
+            // broadcast channel only delivers ids published after
+            // subscribing. A double delivery (queue + snapshot) is fine:
+            // the client page keys its rows by event id.
+            let mut receiver = log.subscribe();
+            let mut last_sent_id = 0u64;
+
             // Hello: the full snapshot, newest first, then live updates.
             for event in log.snapshot() {
                 let line = format!(
@@ -351,10 +359,10 @@ async fn handle(mut socket: TcpStream, log: Arc<EventLog>) -> std::io::Result<()
                     serde_json::to_string(&event).unwrap_or_default()
                 );
                 socket.write_all(line.as_bytes()).await?;
+                last_sent_id = event.id;
             }
             let _ = socket.flush().await;
 
-            let mut receiver = log.subscribe();
             loop {
                 match receiver.recv().await {
                     Ok(id) => {
@@ -367,9 +375,29 @@ async fn handle(mut socket: TcpStream, log: Arc<EventLog>) -> std::io::Result<()
                                 break;
                             }
                             let _ = socket.flush().await;
+                            last_sent_id = last_sent_id.max(id);
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Missed notifications: re-send everything newer
+                        // than what this client got (ids are monotonic).
+                        // Events already evicted from the ring are gone for
+                        // good — the newest ones still arrive.
+                        for event in log.snapshot().into_iter().rev() {
+                            if event.id <= last_sent_id {
+                                continue;
+                            }
+                            let line = format!(
+                                "data: {}\n\n",
+                                serde_json::to_string(&event).unwrap_or_default()
+                            );
+                            if socket.write_all(line.as_bytes()).await.is_err() {
+                                return Ok(());
+                            }
+                            last_sent_id = event.id;
+                        }
+                        let _ = socket.flush().await;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -502,5 +530,58 @@ mod tests {
         socket.read_to_string(&mut response).await.unwrap();
 
         assert!(response.contains("404"));
+    }
+
+    #[tokio::test]
+    async fn stream_sends_hello_snapshot_with_data_prefix() {
+        let log = EventLog::new();
+        log.record_request(
+            "GET",
+            "a.example.com",
+            "/x",
+            Decision::Missed {
+                reason: "host not configured".into(),
+            },
+        );
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, Arc::clone(&log)));
+
+        let mut socket = TcpStream::connect(addr).await.unwrap();
+        socket
+            .write_all(b"GET /stream HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+
+        // The hello (headers + snapshot lines) must arrive promptly; the
+        // stream itself stays open (SSE), so read until the data lines show
+        // up instead of read_to_string.
+        let read = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let marker = b"data: {";
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf
+                    .windows(marker.len())
+                    .any(|window| window == marker.as_slice())
+                {
+                    break;
+                }
+            }
+            buf
+        })
+        .await
+        .expect("hello snapshot must arrive within the timeout");
+
+        let hello = String::from_utf8_lossy(&read);
+        assert!(hello.contains("200 OK"), "{hello}");
+        assert!(hello.contains("data: {"), "{hello}");
+        assert!(hello.contains("a.example.com"), "{hello}");
     }
 }
