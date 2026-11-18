@@ -113,6 +113,10 @@ struct RunArgs {
     #[arg(long)]
     csp_override: Option<String>,
 
+    /// Do not watch the rules file for changes: rule edits require a restart.
+    #[arg(long)]
+    no_hot_reload: bool,
+
     /// Browser arguments after `--`.
     #[arg(last = true, trailing_var_arg = true)]
     browser_args: Vec<String>,
@@ -292,15 +296,19 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Hot reload: watch the rules file so edits apply without restarting the
     // proxy or the browser (keeping the browser session alive is the point).
     if let Some(path) = args.file.as_deref() {
-        // Detached task: lives until the process exits.
-        tokio::spawn(watch_rules_file(
-            std::path::PathBuf::from(path),
-            handler.rules_handle(),
-            std::sync::Arc::clone(&shared_pac),
-            proxy_addr.port(),
-            route_all,
-            std::time::Duration::from_millis(300),
-        ));
+        if args.no_hot_reload {
+            info!("hot reload disabled (--no-hot-reload): rule edits need a restart");
+        } else {
+            // Detached task: lives until the process exits.
+            tokio::spawn(watch_rules_file(
+                std::path::PathBuf::from(path),
+                handler.rules_handle(),
+                std::sync::Arc::clone(&shared_pac),
+                proxy_addr.port(),
+                route_all,
+                std::time::Duration::from_millis(300),
+            ));
+        }
     }
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -563,9 +571,14 @@ async fn watch_rules_file(
                     .map(|rule| rule.host().to_string())
                     .collect();
 
+                // Rules first, PAC second: if the PAC swapped first, a new
+                // host would be tunneled through the proxy during the window
+                // before the rules appear, hitting "host not configured".
+                // Swapping rules first only leaves the host on DIRECT a
+                // moment longer — the status quo before the edit.
+                *rules.write().expect("rules lock is poisoned") = new_rules;
                 *pac_content.write().expect("PAC content lock is poisoned") =
                     pac::content(&hosts, proxy_port, route_all);
-                *rules.write().expect("rules lock is poisoned") = new_rules;
 
                 info!(
                     "rules file reloaded: {}",
@@ -618,6 +631,7 @@ mod tests {
             target: None,
             proxy_port: 0,
             csp_override: None,
+            no_hot_reload: false,
             browser_args: vec![],
         }
     }
