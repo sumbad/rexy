@@ -168,6 +168,8 @@ impl Recorder {
         std::fs::create_dir_all(dir)
             .map_err(|err| format!("failed to create record dir {}: {err}", dir.display()))?;
 
+        remove_stale_flush_temps(dir);
+
         Ok(Self {
             state: Arc::new(RecorderState {
                 path: dir.join("rexy-session.har"),
@@ -300,6 +302,23 @@ fn flush_state(state: &RecorderState) -> std::io::Result<()> {
         .with_extension(format!("har.{}.tmp", std::process::id()));
     std::fs::write(&tmp, har.to_json())?;
     std::fs::rename(tmp, &state.path)
+}
+
+/// Delete `rexy-session.har.<pid>.tmp` leftovers of a previous session: a
+/// SIGKILL in the middle of a flush skips the rename, and the new session
+/// owns the record directory, so the orphaned temp copies are garbage.
+fn remove_stale_flush_temps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("rexy-session.har.") && name.ends_with(".tmp") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// RFC 3339 timestamp from epoch milliseconds (no external time crates: HAR
@@ -642,5 +661,60 @@ mod tests {
             iso8601_millis(1_700_000_000_123),
             "2023-11-14T22:13:20.123Z"
         );
+    }
+
+    #[test]
+    fn drop_flushes_the_whole_throttled_session() {
+        let dir = std::env::temp_dir().join(format!("rexy-har-drop-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let recorder = Recorder::start(&dir).unwrap();
+        // 130 exchanges: the throttled phase (every 25th flush) is well
+        // behind the 100-entry always-write boundary.
+        for i in 0..130 {
+            recorder.record(
+                "GET",
+                &format!("https://a.example.com/x{i}"),
+                vec![],
+                200,
+                vec![],
+                b"body",
+                1,
+            );
+        }
+        // No flush(): the Drop impl must land every exchange on disk —
+        // a graceful shutdown never loses recorded traffic.
+        drop(recorder);
+
+        let replayer = Replayer::open(&dir.join("rexy-session.har")).unwrap();
+        assert_eq!(replayer.entry_count(), 130);
+        assert!(
+            replayer
+                .lookup("GET", "https://a.example.com/x129")
+                .is_some(),
+            "the very last exchange must be in the file"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stale_flush_temp_files_are_cleaned_on_start() {
+        let dir = std::env::temp_dir().join(format!("rexy-har-stale-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A SIGKILL mid-flush leaves the temp copy behind.
+        let stale = dir.join("rexy-session.har.999999.tmp");
+        std::fs::write(&stale, b"{}").unwrap();
+        let keep = dir.join("rexy-session.har");
+        std::fs::write(&keep, b"{}").unwrap();
+
+        Recorder::start(&dir).unwrap();
+
+        assert!(!stale.exists(), "stale flush temp must be removed");
+        assert!(keep.exists(), "the HAR file itself must be kept");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
