@@ -306,21 +306,25 @@ fn request_host_header(request: &str) -> Option<&str> {
 
 /// Whether the `Host` header names this server itself. The header is parsed
 /// as host:port: clients legitimately omit the port (curl on the default
-/// port 80 sends `Host: localhost`), append trailing root dots
-/// (`localhost.`) and use any case (`LocalHost`) — all of those must pass.
-/// Anything else (a rebinding host resolved to 127.0.0.1) is refused.
+/// port 80 sends `Host: localhost`), send an empty one (`localhost:`, the
+/// RFC 3986 default-port form), append trailing root dots (`localhost.`) and
+/// use any case (`LocalHost`) — all of those must pass. Anything else (a
+/// rebinding host resolved to 127.0.0.1, bracketed or bare IPv6 — matching
+/// is IPv4-name based — or an out-of-range port) is refused.
 fn is_local_host(host_header: &str, bound_port: u16) -> bool {
     let host_header = host_header.trim_end_matches('.');
 
     // Split off the port at the last colon; a tail that is not purely
     // numeric (an unbracketed IPv6 literal, for instance) means no port.
     let (host, port) = match host_header.rsplit_once(':') {
-        Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
-            match port.parse::<u16>() {
-                Ok(port) => (host, Some(port)),
-                Err(_) => return false,
-            }
-        }
+        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => match port.parse::<u16>()
+        {
+            Ok(port) => (host, Some(port)),
+            // An empty port is the default port (RFC 3986) — the bound one
+            // here; a number outside u16 is not a port at all.
+            Err(_) if port.is_empty() => (host, None),
+            Err(_) => return false,
+        },
         _ => (host_header, None),
     };
 
@@ -434,7 +438,16 @@ async fn handle(mut socket: TcpStream, log: Arc<EventLog>, bound_port: u16) -> s
                         // so recv() would never re-deliver them) and re-sent
                         // below, after the older catch-up ids — the retained
                         // ones are the newest, so the client still sees ids
-                        // in ascending order without duplicates.
+                        // in ascending order.
+                        //
+                        // The ring loop is bounded by the newest retained id:
+                        // an event recorded after the drain is newer still and
+                        // reaches this client through recv() in order —
+                        // sending it from the snapshot here would break the
+                        // ordering and duplicate it later. In-place response
+                        // updates re-notify an old id on purpose; the client
+                        // page keys its rows by id, so a repeated id is at
+                        // worst an idempotent re-render.
                         let mut retained = Vec::new();
                         loop {
                             match receiver.try_recv() {
@@ -445,15 +458,18 @@ async fn handle(mut socket: TcpStream, log: Arc<EventLog>, bound_port: u16) -> s
                         }
                         retained.sort_unstable();
                         retained.dedup();
+                        let retained_max = retained.last().copied().unwrap_or(last_sent_id);
                         let retained_set: std::collections::HashSet<u64> =
                             retained.iter().copied().collect();
 
-                        // Everything else newer than what this client got is
-                        // fetched from the ring (ids are monotonic). Events
-                        // already evicted from the ring are gone for good —
-                        // the newest ones still arrive.
+                        // Older missed events from the ring (ids are
+                        // monotonic). Events already evicted from the ring are
+                        // gone for good — the newest ones still arrive.
                         for event in log.snapshot().into_iter().rev() {
-                            if event.id <= last_sent_id || retained_set.contains(&event.id) {
+                            if event.id <= last_sent_id
+                                || event.id > retained_max
+                                || retained_set.contains(&event.id)
+                            {
                                 continue;
                             }
                             let line = format!(
@@ -668,17 +684,24 @@ mod tests {
         assert!(is_local_host("LOCALHOST", 8125));
 
         // Case-insensitive, trailing root dots on the host or after the
-        // port, and an explicit correct port all pass.
+        // port, an explicit correct port, and an empty port (the RFC 3986
+        // default-port form) all pass.
         assert!(is_local_host("LocalHost:8125", 8125));
         assert!(is_local_host("localhost.:8125", 8125));
         assert!(is_local_host("localhost:8125.", 8125));
         assert!(is_local_host("127.0.0.1:8125", 8125));
+        assert!(is_local_host("localhost:", 8125));
 
-        // Anything else is refused: other hosts, wrong ports.
+        // Anything else is refused: other hosts, wrong ports, bracketed or
+        // bare IPv6 literals (matching is IPv4-name based), out-of-range
+        // port numbers.
         assert!(!is_local_host("evil.example.com:8125", 8125));
         assert!(!is_local_host("127.0.0.1:9999", 8125));
         assert!(!is_local_host("localhost:80", 8125));
         assert!(!is_local_host("localhost.:8125", 9999));
+        assert!(!is_local_host("[::1]:8125", 8125));
+        assert!(!is_local_host("::1", 8125));
+        assert!(!is_local_host("localhost:65536", 8125));
     }
 
     #[tokio::test]
