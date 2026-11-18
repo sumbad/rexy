@@ -280,6 +280,18 @@ pub fn validate_host(host: &str) -> Result<(), Box<dyn std::error::Error>> {
         return Err("host must not contain a path".into());
     }
 
+    // WHY: the host is embedded into generated PAC JavaScript (pac.rs builds
+    // `host === "<host>"` conditions) — quotes, backslashes or braces there
+    // would allow injecting arbitrary code into FindProxyForURL. Domain
+    // names, including punycode `xn--` labels, are fully covered by this
+    // whitelist.
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return Err("host may only contain ASCII letters, digits, dots and dashes".into());
+    }
+
     Ok(())
 }
 
@@ -294,7 +306,11 @@ pub fn validate_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 pub fn validate_target(target: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Map Local: serve static files from a directory instead of a dev server.
     if let Some(dir) = target.strip_prefix("file:") {
-        if dir.trim().is_empty() {
+        // RedirectRule::new trims trailing slashes off the target, so
+        // "file:/" degrades to "file:" — an eternal 404 with no hint about
+        // the misconfiguration. Check emptiness after the same
+        // normalization the rule applies.
+        if dir.trim().trim_end_matches('/').is_empty() {
             return Err(
                 "file: target must contain a directory path, e.g. file:/path/to/assets".into(),
             );
@@ -324,10 +340,13 @@ mod tests {
     use super::*;
 
     fn write_temp_config(content: &str) -> std::path::PathBuf {
+        // A counter, not the content length: two configs of the same length
+        // written in one test run must not collide on the temp path.
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
             "rexy-config-test-{}-{}.toml",
             std::process::id(),
-            content.len()
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::write(&path, content).unwrap();
         path
@@ -459,6 +478,22 @@ target = "file:"
         assert!(load_rules(&path).is_err());
 
         std::fs::remove_file(&path).ok();
+
+        // "file:/" is a valid target syntactically, but RedirectRule::new
+        // trims the trailing slash, leaving an empty directory — the rule
+        // would 404 forever with no hint. It must fail at load time.
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "assets.example.com"
+target = "file:/"
+"#,
+        );
+
+        let err = load_rules(&path).unwrap_err().to_string();
+        assert!(err.contains("rule #1 (field target)"), "{err}");
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -498,6 +533,32 @@ target = "http://127.0.0.1:1111"
 
         assert!(load_rules(&path).is_err());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn host_whitelist_rejects_pac_injection_characters() {
+        // The host is embedded into PAC JavaScript: quotes, backslashes and
+        // braces must not survive validation.
+        for bad in [
+            "a.example.com\"; alert(1); \"",
+            "a.example.com\\",
+            "a.example.com${x}",
+            "a example.com",
+            "a_example.com",
+            "a@example.com",
+            "a.example.com:443",
+        ] {
+            assert!(validate_host(bad).is_err(), "{bad} must be rejected");
+        }
+
+        // Real-world hostnames pass: subdomains, punycode, dashes.
+        for good in [
+            "a.example.com",
+            "xn--80ak6aa92e.example",
+            "my-team.internal",
+        ] {
+            assert!(validate_host(good).is_ok(), "{good} must be accepted");
+        }
     }
 
     #[test]

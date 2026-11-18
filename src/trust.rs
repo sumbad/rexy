@@ -326,8 +326,24 @@ pub fn install_firefox() -> Result<(), Box<dyn std::error::Error>> {
 
     let der = ca_der()?;
 
+    let result = install_into_profiles(&dirs, &der);
+
+    // The DER copy in the shared temp dir must not outlive the install:
+    // fs::write follows symlinks, so leaving a file at a predictable path
+    // is a plant-the-file target. Remove it regardless of the outcome.
+    let _ = fs::remove_file(&der);
+
+    result.map(|_| ())
+}
+
+/// Import the CA into every existing profile directory; returns the number
+/// of profiles modified via `installed`.
+fn install_into_profiles(
+    dirs: &[std::path::PathBuf],
+    der: &std::path::Path,
+) -> Result<usize, Box<dyn std::error::Error>> {
     let mut installed = 0usize;
-    for dir in &dirs {
+    for dir in dirs {
         if !dir.exists() {
             tracing::warn!(profile = %dir.display(), "profile directory missing, skipping");
             continue;
@@ -373,7 +389,7 @@ pub fn install_firefox() -> Result<(), Box<dyn std::error::Error>> {
         return Err("no Firefox profile was modified".into());
     }
 
-    Ok(())
+    Ok(installed)
 }
 
 /// Remove the Rexy CA from every Firefox profile (ignore "not found").
@@ -416,7 +432,8 @@ fn which_certutil() -> Option<std::path::PathBuf> {
 }
 
 /// DER bytes of the local CA: certutil -A expects DER, while `ca/rexy.cer`
-/// is PEM — strip the armor and base64-decode.
+/// is PEM — strip the armor and base64-decode. The caller must remove the
+/// temp file when done (see `install_firefox`).
 fn ca_der() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     use base64::Engine;
 
@@ -431,7 +448,14 @@ fn ca_der() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
         .decode(body.trim())
         .map_err(|err| format!("CA certificate is not valid PEM: {err}"))?;
 
-    let tmp = std::env::temp_dir().join(format!("rexy-ca-{}.der", std::process::id()));
+    // Predictable temp paths are a symlink-planting target (fs::write
+    // follows symlinks): the nanosecond component keeps a second call in
+    // the same process — or a pid collision — from reusing the path.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("rexy-ca-{}-{nanos}.der", std::process::id()));
     fs::write(&tmp, decoded)?;
 
     Ok(tmp)

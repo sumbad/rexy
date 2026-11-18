@@ -225,7 +225,15 @@ impl DevRedirect {
             text.as_bytes().to_vec()
         };
 
-        tracing::info!(%url, status = recorded.status, "replaying response from fixtures");
+        // The URL (query included) may carry session tokens — the info line
+        // stays query-free, the full URL is debug-level.
+        tracing::info!(
+            host = %DevRedirect::request_host(req).unwrap_or_default(),
+            path = %req.uri().path(),
+            status = recorded.status,
+            "replaying response from fixtures"
+        );
+        tracing::debug!(%url, "replayed fixture URL");
 
         Some(
             builder
@@ -411,13 +419,16 @@ impl DevRedirect {
 
         let matched = self.matching_rule_index(&req);
 
+        // The request URI may carry tokens in its query — the info line
+        // logs the path only, the full URI is debug-level.
         tracing::info!(
             method = %req.method(),
             host = ?req.headers().get(header::HOST),
-            uri = %req.uri(),
+            path = %req.uri().path(),
             matches = matched.is_some(),
             "HTTP request"
         );
+        tracing::debug!(uri = %req.uri(), "HTTP request URI");
 
         let started_ms = now_ms();
 
