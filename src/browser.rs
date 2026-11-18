@@ -78,6 +78,18 @@ impl Browser {
         pac_url: &str,
         browser_args: &[String],
     ) -> Result<Child, Box<dyn std::error::Error>> {
+        if !isolates_profile(browser_args) {
+            // WHY no throwaway profile by default: rexy deliberately drives
+            // the user's live sessions (prod accounts included) — an
+            // isolated profile would defeat that. The handoff risk is
+            // reported instead of silently worked around.
+            tracing::warn!(
+                "Chrome may hand off to an already-running instance and ignore the proxy flags; \
+                 pass an isolated profile after `--` to be safe: \
+                 -- --user-data-dir=/tmp/rexy-chrome-profile"
+            );
+        }
+
         let mut command = Command::new(&self.executable);
 
         command
@@ -105,6 +117,23 @@ impl Browser {
 
         std::fs::write(profile.join("user.js"), firefox_user_js(pac_url))?;
 
+        // Firefox does not read the OS trust store: without the CA in this
+        // profile, interception fails with certificate errors on Linux /
+        // older versions / enterprise policies even after `rexy trust`.
+        // Best effort — a missing certutil must not stop the launch.
+        match crate::trust::import_ca_into_nss_profile(&profile) {
+            Ok(()) => tracing::info!(
+                profile = %profile.display(),
+                "CA imported into the throwaway Firefox profile"
+            ),
+            Err(err) => tracing::warn!(
+                %err,
+                profile = %profile.display(),
+                "CA was not installed into the Firefox profile; sites may fail with \
+                 certificate errors — install NSS certutil (rexy trust --firefox uses it too)"
+            ),
+        }
+
         let mut command = Command::new(&self.executable);
 
         command
@@ -118,6 +147,13 @@ impl Browser {
 
         Ok(command.spawn()?)
     }
+}
+
+/// Whether the browser args pin an isolated profile (`--user-data-dir`):
+/// without one, Chromium hands the command line off to an already-running
+/// instance and the proxy flags are silently ignored.
+fn isolates_profile(browser_args: &[String]) -> bool {
+    browser_args.iter().any(|arg| arg.contains("user-data-dir"))
 }
 
 /// prefs.js content for the throwaway Firefox profile.
@@ -262,4 +298,28 @@ fn find_chromium() -> Result<PathBuf, Box<dyn std::error::Error>> {
     }
 
     Err("Chromium was not found; pass --browser /path/to/chromium".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_data_dir_in_any_form_isolates_the_session() {
+        let flag_value = vec!["--user-data-dir=/tmp/rexy-chrome".to_string()];
+        assert!(isolates_profile(&flag_value));
+
+        let flag_separate = vec![
+            "--user-data-dir".to_string(),
+            "/tmp/rexy-chrome".to_string(),
+        ];
+        assert!(isolates_profile(&flag_separate));
+
+        let unrelated: Vec<String> = vec![
+            "--new-window".to_string(),
+            "https://example.com/".to_string(),
+        ];
+        assert!(!isolates_profile(&unrelated));
+        assert!(!isolates_profile(&[]));
+    }
 }

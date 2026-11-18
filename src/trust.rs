@@ -336,6 +336,42 @@ pub fn install_firefox() -> Result<(), Box<dyn std::error::Error>> {
     result.map(|_| ())
 }
 
+/// Ensure the NSS DB exists in `dir` (created with an empty password when
+/// the profile has never been used) and import the CA from `der`.
+fn import_into_nss_dir(
+    dir: &std::path::Path,
+    der: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // NSS DB must exist before -A; create it silently when the profile
+    // has never been used.
+    if !dir.join("cert9.db").exists() {
+        run(
+            "certutil",
+            &[
+                "-N",
+                "-d",
+                &format!("sql:{}", dir.display()),
+                "--empty-password",
+            ],
+        )?;
+    }
+
+    run(
+        "certutil",
+        &[
+            "-A",
+            "-d",
+            &format!("sql:{}", dir.display()),
+            "-n",
+            CA_NAME,
+            "-t",
+            "C,,",
+            "-i",
+            der.to_string_lossy().as_ref(),
+        ],
+    )
+}
+
 /// Import the CA into every existing profile directory; returns the number
 /// of profiles modified via `installed`.
 fn install_into_profiles(
@@ -349,34 +385,7 @@ fn install_into_profiles(
             continue;
         }
 
-        // NSS DB must exist before -A; create it silently when the profile
-        // has never been used.
-        if !dir.join("cert9.db").exists() {
-            run(
-                "certutil",
-                &[
-                    "-N",
-                    "-d",
-                    &format!("sql:{}", dir.display()),
-                    "--empty-password",
-                ],
-            )?;
-        }
-
-        run(
-            "certutil",
-            &[
-                "-A",
-                "-d",
-                &format!("sql:{}", dir.display()),
-                "-n",
-                CA_NAME,
-                "-t",
-                "C,,",
-                "-i",
-                der.to_string_lossy().as_ref(),
-            ],
-        )?;
+        import_into_nss_dir(dir, der)?;
 
         println!(
             "✓ {CA_NAME} installed into Firefox profile {}",
@@ -390,6 +399,24 @@ fn install_into_profiles(
     }
 
     Ok(installed)
+}
+
+/// Import the local CA into one NSS profile directory — used for real
+/// Firefox profiles (`trust --firefox`) and for the throwaway proxy profile
+/// spawned by `--browser firefox` (browser.rs). Fails with the certutil
+/// install hint when the NSS tools are not on PATH.
+pub(crate) fn import_ca_into_nss_profile(
+    dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if which_certutil().is_none() {
+        return Err(certutil_hint().into());
+    }
+
+    let der = ca_der()?;
+    let result = import_into_nss_dir(dir, &der);
+    // The temp DER copy must not outlive the import (see ca_der).
+    let _ = fs::remove_file(&der);
+    result
 }
 
 /// Remove the Rexy CA from every Firefox profile (ignore "not found").
