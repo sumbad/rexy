@@ -143,19 +143,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
 
-    Some(Command::Run(args)) => run(*args).await?,
+        Some(Command::Run(args)) => run(*args).await?,
 
-    Some(Command::Rules { command }) => match command {
-        RulesCommand::Check { file, json, urls } => rules_check(&file, json, &urls)?,
-    },
+        Some(Command::Rules { command }) => match command {
+            RulesCommand::Check { file, json, urls } => rules_check(&file, json, &urls)?,
+        },
 
-    None => {
-        println!("Use:");
-        println!();
-        println!("  rexy run --file <rules.toml>");
-        println!("  rexy run --host <host> --path <path> --target <url> -- <browser args>");
-        println!("  rexy rules check -f <rules.toml> <url>...");
-        println!();
+        None => {
+            println!("Use:");
+            println!();
+            println!("  rexy run --file <rules.toml>");
+            println!("  rexy run --host <host> --path <path> --target <url> -- <browser args>");
+            println!("  rexy rules check -f <rules.toml> <url>...");
+            println!();
             println!("Example:");
             println!();
             println!("  rexy run \\");
@@ -211,7 +211,9 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let pac_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let pac_addr = pac_listener.local_addr()?;
     let pac_hosts: Vec<String> = rules.iter().map(|rule| rule.host().to_string()).collect();
-    let route_all = std::env::var("REXY_PAC_ALL").map(|v| v == "1").unwrap_or(false);
+    let route_all = std::env::var("REXY_PAC_ALL")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let pac_content = pac::content(&pac_hosts, proxy_addr.port(), route_all);
     let shared_pac = std::sync::Arc::new(std::sync::RwLock::new(pac_content));
     tokio::spawn(pac::serve(pac_listener, std::sync::Arc::clone(&shared_pac)));
@@ -387,11 +389,16 @@ enum Fixtures {
 
 fn resolve_fixtures(args: &RunArgs) -> Result<Fixtures, Box<dyn std::error::Error>> {
     match (&args.record, &args.replay) {
-        (Some(_), Some(_)) => {
-            Err("--record and --replay are mutually exclusive: record a session first, then replay it".into())
-        }
-        (Some(dir), None) => Ok(Fixtures::Record(fixtures::Recorder::start(std::path::Path::new(dir))?)),
-        (None, Some(path)) => Ok(Fixtures::Replay(fixtures::Replayer::open(std::path::Path::new(path))?)),
+        (Some(_), Some(_)) => Err(
+            "--record and --replay are mutually exclusive: record a session first, then replay it"
+                .into(),
+        ),
+        (Some(dir), None) => Ok(Fixtures::Record(fixtures::Recorder::start(
+            std::path::Path::new(dir),
+        )?)),
+        (None, Some(path)) => Ok(Fixtures::Replay(fixtures::Replayer::open(
+            std::path::Path::new(path),
+        )?)),
         (None, None) => Ok(Fixtures::None),
     }
 }
@@ -432,18 +439,21 @@ fn resolve_rules(args: &RunArgs) -> Result<Vec<RedirectRule>, Box<dyn std::error
     config::validate_path(&path)?;
     config::validate_target(&target)?;
 
-    Ok(vec![RedirectRule::new(host, path, target, csp_override, true, false)])
+    Ok(vec![RedirectRule::new(
+        host,
+        path,
+        target,
+        csp_override,
+        true,
+        false,
+    )])
 }
 
 /// `rexy rules check -f <rules.toml> <url>...`: offline rule evaluation using
 /// the same matcher as the proxy, for config sanity checks from CI and agent
 /// scripts. Unmatched URLs are a normal result (exit code stays 0); an invalid
 /// URL or config file is an error.
-fn rules_check(
-    file: &str,
-    json: bool,
-    urls: &[String],
-) -> Result<(), Box<dyn std::error::Error>> {
+fn rules_check(file: &str, json: bool, urls: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let rules = config::load_rules(std::path::Path::new(file))?;
 
     let outcomes: Vec<CheckOutcome> = urls
@@ -477,7 +487,10 @@ fn print_check_outcome(outcome: &CheckOutcome) {
     println!(
         "match {} -> rule #{} (path {}) -> {}{}",
         outcome.url,
-        outcome.rule_index.expect("matched outcome has a rule index") + 1,
+        outcome
+            .rule_index
+            .expect("matched outcome has a rule index")
+            + 1,
         outcome.rule_path.as_deref().unwrap_or("/"),
         outcome.target.as_deref().unwrap_or_default(),
         csp
@@ -530,7 +543,10 @@ async fn watch_rules_file(
                     pac::content(&hosts, proxy_port, route_all);
                 *rules.write().expect("rules lock is poisoned") = new_rules;
 
-                info!("rules file reloaded: {}", describe(&rules.read().expect("rules lock is poisoned")));
+                info!(
+                    "rules file reloaded: {}",
+                    describe(&rules.read().expect("rules lock is poisoned"))
+                );
             }
             Err(err) => {
                 tracing::warn!(
@@ -546,12 +562,10 @@ async fn watch_rules_file(
 /// rename, so the identity of the file can change — polling mtime+size of the
 /// path catches that as well as in-place writes.
 fn file_signature(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
-    std::fs::metadata(path)
-        .ok()
-        .and_then(|meta| {
-            let modified = meta.modified().ok()?;
-            Some((modified, meta.len()))
-        })
+    std::fs::metadata(path).ok().and_then(|meta| {
+        let modified = meta.modified().ok()?;
+        Some((modified, meta.len()))
+    })
 }
 
 fn init_logging() {
@@ -626,7 +640,8 @@ mod tests {
 
     #[tokio::test]
     async fn hot_reload_applies_changed_rules_and_regenerates_pac() {
-        let path = std::env::temp_dir().join(format!("rexy-hot-reload-{}.toml", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("rexy-hot-reload-{}.toml", std::process::id()));
         std::fs::write(
             &path,
             "[[rules]]\nhost = \"a.example.com\"\ntarget = \"http://127.0.0.1:1111\"\n",

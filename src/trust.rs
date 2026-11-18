@@ -309,7 +309,10 @@ pub fn install_firefox() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let ini_dir = ini.parent().expect("profiles.ini has a parent").to_path_buf();
+    let ini_dir = ini
+        .parent()
+        .expect("profiles.ini has a parent")
+        .to_path_buf();
     let ini_content = fs::read_to_string(&ini)?;
     let dirs = profile_dirs(&ini_content, &ini_dir);
 
@@ -335,7 +338,12 @@ pub fn install_firefox() -> Result<(), Box<dyn std::error::Error>> {
         if !dir.join("cert9.db").exists() {
             run(
                 "certutil",
-                &["-N", "-d", &format!("sql:{}", dir.display()), "--empty-password"],
+                &[
+                    "-N",
+                    "-d",
+                    &format!("sql:{}", dir.display()),
+                    "--empty-password",
+                ],
             )?;
         }
 
@@ -354,7 +362,10 @@ pub fn install_firefox() -> Result<(), Box<dyn std::error::Error>> {
             ],
         )?;
 
-        println!("✓ {CA_NAME} installed into Firefox profile {}", dir.display());
+        println!(
+            "✓ {CA_NAME} installed into Firefox profile {}",
+            dir.display()
+        );
         installed += 1;
     }
 
@@ -371,31 +382,24 @@ pub fn remove_firefox() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("cannot locate the Firefox profiles directory (is Firefox installed?)")?;
 
     if !ini.exists() {
-        return Err(format!(
-            "Firefox profiles.ini not found at {}",
-            ini.display()
-        )
-        .into());
+        return Err(format!("Firefox profiles.ini not found at {}", ini.display()).into());
     }
 
     if which_certutil().is_none() {
         return Err(certutil_hint().into());
     }
 
-    let ini_dir = ini.parent().expect("profiles.ini has a parent").to_path_buf();
+    let ini_dir = ini
+        .parent()
+        .expect("profiles.ini has a parent")
+        .to_path_buf();
     let dirs = profile_dirs(&fs::read_to_string(&ini)?, &ini_dir);
 
     for dir in dirs {
         // -D fails when the nickname is absent — that is the expected state
         // for profiles never touched by rexy, so ignore the exit status.
         let _ = std::process::Command::new("certutil")
-            .args([
-                "-D",
-                "-d",
-                &format!("sql:{}", dir.display()),
-                "-n",
-                CA_NAME,
-            ])
+            .args(["-D", "-d", &format!("sql:{}", dir.display()), "-n", CA_NAME])
             .status();
     }
 
@@ -495,4 +499,3 @@ Path=/Users/me/FirefoxProfiles/work
         assert!(user_js.contains("user_pref(\"network.http.http3.enable\", false);"));
     }
 }
-

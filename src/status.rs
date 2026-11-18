@@ -131,15 +131,13 @@ impl EventLog {
     }
 
     /// Record an HTTP request with its rule decision; returns the event id.
-    pub fn record_request(
-        &self,
-        method: &str,
-        host: &str,
-        path: &str,
-        decision: Decision,
-    ) -> u64 {
-        let mut event =
-            Event::new("request", host.to_string(), path.to_string(), method.to_string());
+    pub fn record_request(&self, method: &str, host: &str, path: &str, decision: Decision) -> u64 {
+        let mut event = Event::new(
+            "request",
+            host.to_string(),
+            path.to_string(),
+            method.to_string(),
+        );
         event.decision = Some(decision);
         self.push(event).read().expect("event lock").id
     }
@@ -148,8 +146,9 @@ impl EventLog {
     pub fn record_response(&self, id: u64, status: u16, duration_ms: u64) {
         {
             let buffer = self.buffer.lock().expect("event buffer lock");
-            if let Some(event) =
-                buffer.iter().find(|event| event.read().expect("event lock").id == id)
+            if let Some(event) = buffer
+                .iter()
+                .find(|event| event.read().expect("event lock").id == id)
             {
                 let mut guard = event.write().expect("event lock");
                 guard.status = Some(status);
@@ -347,7 +346,10 @@ async fn handle(mut socket: TcpStream, log: Arc<EventLog>) -> std::io::Result<()
 
             // Hello: the full snapshot, newest first, then live updates.
             for event in log.snapshot() {
-                let line = format!("data: {}\n\n", serde_json::to_string(&event).unwrap_or_default());
+                let line = format!(
+                    "data: {}\n\n",
+                    serde_json::to_string(&event).unwrap_or_default()
+                );
                 socket.write_all(line.as_bytes()).await?;
             }
             let _ = socket.flush().await;
@@ -373,7 +375,8 @@ async fn handle(mut socket: TcpStream, log: Arc<EventLog>) -> std::io::Result<()
             }
         }
         _ => {
-            let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let response =
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             socket.write_all(response.as_bytes()).await?;
         }
     }
@@ -431,7 +434,10 @@ mod tests {
         }
 
         assert_eq!(log.snapshot().len(), BUFFER_CAPACITY);
-        assert_eq!(log.snapshot()[0].host, format!("host-{}.example.com", BUFFER_CAPACITY + 49));
+        assert_eq!(
+            log.snapshot()[0].host,
+            format!("host-{}.example.com", BUFFER_CAPACITY + 49)
+        );
     }
 
     #[test]
@@ -453,7 +459,10 @@ mod tests {
         let snapshot = log.snapshot();
         assert_eq!(snapshot[0].status, Some(200));
         assert_eq!(snapshot[0].duration_ms, Some(42));
-        assert!(matches!(snapshot[0].decision, Some(Decision::Matched { .. })));
+        assert!(matches!(
+            snapshot[0].decision,
+            Some(Decision::Matched { .. })
+        ));
     }
 
     #[tokio::test]

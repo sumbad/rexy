@@ -107,8 +107,7 @@ impl Har {
     }
 
     pub fn from_str(raw: &str) -> Result<Self, String> {
-        let har: Har = serde_json::from_str(raw)
-            .map_err(|err| format!("not a HAR file: {err}"))?;
+        let har: Har = serde_json::from_str(raw).map_err(|err| format!("not a HAR file: {err}"))?;
 
         if har.log.version != "1.2" {
             return Err(format!("unsupported HAR version: {}", har.log.version));
@@ -134,10 +133,11 @@ pub struct Recorder {
 
 impl std::fmt::Debug for Recorder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Recorder").field("path", &self.path).finish()
+        f.debug_struct("Recorder")
+            .field("path", &self.path)
+            .finish()
     }
 }
-
 
 impl Recorder {
     pub fn start(dir: &Path) -> Result<Self, String> {
@@ -266,7 +266,10 @@ impl Replayer {
         let mut no_query = HashMap::new();
 
         for entry in har.log.entries {
-            let key = (entry.request.method.to_ascii_uppercase(), entry.request.url.clone());
+            let key = (
+                entry.request.method.to_ascii_uppercase(),
+                entry.request.url.clone(),
+            );
             no_query
                 .entry((key.0.clone(), strip_query(&key.1)))
                 .or_insert(entry.response.clone());
@@ -355,10 +358,16 @@ mod tests {
         assert_eq!(hit.content.text, "Y29uc29sZS5sb2coMSk=");
 
         // Different URL or method misses.
-        assert!(replayer.lookup("GET", "https://a.example.com/other").is_none());
-        assert!(replayer
-            .lookup("POST", "https://a.example.com/api/x?v=1")
-            .is_none());
+        assert!(
+            replayer
+                .lookup("GET", "https://a.example.com/other")
+                .is_none()
+        );
+        assert!(
+            replayer
+                .lookup("POST", "https://a.example.com/api/x?v=1")
+                .is_none()
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -370,8 +379,11 @@ mod tests {
 
         assert!(Replayer::open(&path).is_err());
 
-        std::fs::write(&path, r#"{"log":{"version":"9.9","creator":{"name":"x","version":"1"},"entries":[]}}"#)
-            .unwrap();
+        std::fs::write(
+            &path,
+            r#"{"log":{"version":"9.9","creator":{"name":"x","version":"1"},"entries":[]}}"#,
+        )
+        .unwrap();
         assert!(Replayer::open(&path).is_err());
 
         std::fs::remove_file(&path).ok();
@@ -380,6 +392,9 @@ mod tests {
     #[test]
     fn iso_timestamps_are_utc_rfc3339() {
         assert_eq!(iso8601_millis(0), "1970-01-01T00:00:00.000Z");
-        assert_eq!(iso8601_millis(1_700_000_000_123), "2023-11-14T22:13:20.123Z");
+        assert_eq!(
+            iso8601_millis(1_700_000_000_123),
+            "2023-11-14T22:13:20.123Z"
+        );
     }
 }

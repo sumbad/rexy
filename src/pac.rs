@@ -54,10 +54,7 @@ pub async fn serve(listener: TcpListener, content: std::sync::Arc<std::sync::RwL
     }
 }
 
-async fn handle(
-    mut socket: TcpStream,
-    content: std::sync::Arc<std::sync::RwLock<String>>,
-) {
+async fn handle(mut socket: TcpStream, content: std::sync::Arc<std::sync::RwLock<String>>) {
     // Consume the request until the end of the headers so the response is not interleaved
     // with a still-in-flight request. The PAC fetch is a tiny GET, so a single small buffer
     // covers it, but loop until we see the header terminator just in case.
@@ -97,7 +94,11 @@ mod tests {
 
     #[test]
     fn pac_contains_all_hosts() {
-        let pac = content(&["a.example.com".into(), "b.example.com".into()], 8888, false);
+        let pac = content(
+            &["a.example.com".into(), "b.example.com".into()],
+            8888,
+            false,
+        );
 
         assert!(pac.contains("host === \"a.example.com\" || host.endsWith(\".a.example.com\")"));
         assert!(pac.contains("host === \"b.example.com\" || host.endsWith(\".b.example.com\")"));

@@ -242,10 +242,7 @@ impl DevRedirect {
 
     /// Snapshot of the current rules for startup logging.
     pub fn rules(&self) -> Vec<RedirectRule> {
-        self.rules
-            .read()
-            .expect("rules lock is poisoned")
-            .clone()
+        self.rules.read().expect("rules lock is poisoned").clone()
     }
 
     /// Index (first-match-wins) and a snapshot of the rule matching the
@@ -358,10 +355,7 @@ impl DevRedirect {
             return RequestOrResponse::Response(response);
         }
 
-        self.pending_record = self
-            .recorder
-            .as_ref()
-            .and_then(|_| Self::record_meta(&req));
+        self.pending_record = self.recorder.as_ref().and_then(|_| Self::record_meta(&req));
 
         let matched = self.matching_rule_index(&req);
 
@@ -426,7 +420,10 @@ impl DevRedirect {
 
             if let Some(csp_override) = &edits.csp_override {
                 apply_csp_override(res.headers_mut(), csp_override);
-                tracing::info!(?csp_override, "csp override applied to file-target response");
+                tracing::info!(
+                    ?csp_override,
+                    "csp override applied to file-target response"
+                );
             }
 
             if edits.embed {
@@ -519,9 +516,7 @@ impl DevRedirect {
 
         // Recording needs the whole body, which means buffering: streaming
         // responses (SSE, long-poll) are not suitable for recording anyway.
-        if let (Some(meta), Some(recorder)) =
-            (self.pending_record.take(), self.recorder.clone())
-        {
+        if let (Some(meta), Some(recorder)) = (self.pending_record.take(), self.recorder.clone()) {
             return self.buffer_and_record(recorder, meta, res).await;
         }
 
@@ -642,7 +637,10 @@ fn serve_from_file_target(rule: &RedirectRule, req: &Request<Body>) -> Response<
     let head = req.method() == Method::HEAD;
 
     if req.method() != Method::GET && !head {
-        return plain_response(StatusCode::METHOD_NOT_ALLOWED, "only GET and HEAD are served\n");
+        return plain_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "only GET and HEAD are served\n",
+        );
     }
 
     let Some(url_path) = percent_decode(req.uri().path()) else {
@@ -945,8 +943,10 @@ mod tests {
         let _ = h.handle_request_inner(req);
 
         let mut res = Response::new(Body::empty());
-        res.headers_mut()
-            .insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));
+        res.headers_mut().insert(
+            header::X_FRAME_OPTIONS,
+            header::HeaderValue::from_static("DENY"),
+        );
 
         let res = h.handle_response_inner(res).await;
 
@@ -961,8 +961,10 @@ mod tests {
         let _ = h.handle_request_inner(req);
 
         let mut res = Response::new(Body::empty());
-        res.headers_mut()
-            .insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));
+        res.headers_mut().insert(
+            header::X_FRAME_OPTIONS,
+            header::HeaderValue::from_static("DENY"),
+        );
 
         let res = h.handle_response_inner(res).await;
 
@@ -985,8 +987,10 @@ mod tests {
         let _ = h.handle_request_inner(req);
 
         let mut res = Response::new(Body::empty());
-        res.headers_mut()
-            .insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));
+        res.headers_mut().insert(
+            header::X_FRAME_OPTIONS,
+            header::HeaderValue::from_static("DENY"),
+        );
         res.headers_mut().insert(
             header::CONTENT_SECURITY_POLICY,
             "default-src 'none'".parse().unwrap(),
@@ -1102,7 +1106,7 @@ mod tests {
                 "/app/".into(),
                 "http://127.0.0.1:1111".into(),
                 Some(CspOverride::Policy("policy-a".into())),
-            true,
+                true,
                 false,
             ),
             RedirectRule::new(
@@ -1110,7 +1114,7 @@ mod tests {
                 "/".into(),
                 "http://127.0.0.1:2222".into(),
                 Some(CspOverride::Policy("policy-b".into())),
-            true,
+                true,
                 false,
             ),
             RedirectRule::new(
@@ -1118,7 +1122,7 @@ mod tests {
                 "/".into(),
                 "http://127.0.0.1:3333".into(),
                 Some(CspOverride::Off),
-            true,
+                true,
                 false,
             ),
         ])
@@ -1162,7 +1166,7 @@ mod tests {
                 "/".into(),
                 "http://127.0.0.1:1111".into(),
                 None,
-            true,
+                true,
                 false,
             ),
             RedirectRule::new(
@@ -1170,7 +1174,7 @@ mod tests {
                 "/".into(),
                 "http://127.0.0.1:2222".into(),
                 Some(CspOverride::Off),
-            true,
+                true,
                 false,
             ),
         ]);
@@ -1273,7 +1277,11 @@ mod tests {
         let mut h = file_handler(&dir);
 
         // Literal .. and percent-encoded .. both must be rejected.
-        for path in ["/../secret.txt", "/a/../../secret.txt", "/%2e%2e/secret.txt"] {
+        for path in [
+            "/../secret.txt",
+            "/a/../../secret.txt",
+            "/%2e%2e/secret.txt",
+        ] {
             let res = as_response(h.handle_request_inner(file_request(path)));
             assert_eq!(res.status(), 403, "path {path} must be rejected");
         }
@@ -1291,7 +1299,10 @@ mod tests {
 
         let res = as_response(h.handle_request_inner(file_request("/my%20file.txt")));
         assert_eq!(res.status(), 200);
-        assert_eq!(res.headers()[header::CONTENT_TYPE], "text/plain; charset=utf-8");
+        assert_eq!(
+            res.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -260,7 +260,11 @@ mod tests {
     #[test]
     fn check_url_matches_first_rule_with_numbering() {
         let rules = vec![
-            rule("app.example.com", "/api/v1/omicron/get", "http://127.0.0.1:8124"),
+            rule(
+                "app.example.com",
+                "/api/v1/omicron/get",
+                "http://127.0.0.1:8124",
+            ),
             rule("app.example.com", "/api/", "http://127.0.0.1:8123"),
             rule("other.example.com", "/", "http://127.0.0.1:5173"),
         ];

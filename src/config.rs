@@ -82,8 +82,18 @@ fn shadowed_pairs(rules: &[RedirectRule]) -> Vec<(usize, usize)> {
 fn warn_shadowed_rules(rules: &[RedirectRule]) {
     for (earlier, later) in shadowed_pairs(rules) {
         tracing::warn!(
-            earlier = format!("#{} {}{}", earlier + 1, rules[earlier].host(), rules[earlier].path()),
-            later = format!("#{} {}{}", later + 1, rules[later].host(), rules[later].path()),
+            earlier = format!(
+                "#{} {}{}",
+                earlier + 1,
+                rules[earlier].host(),
+                rules[earlier].path()
+            ),
+            later = format!(
+                "#{} {}{}",
+                later + 1,
+                rules[later].host(),
+                rules[later].path()
+            ),
             "rule is shadowed: the earlier rule matches first (first-match-wins), \
              so the later rule never fires for these paths — \
              reorder rules so the more specific path comes first"
@@ -108,7 +118,9 @@ fn rule_from_file(
     validate_path(&path)?;
     validate_target(&target)?;
 
-    let csp_override = csp_override.map(|value| parse_csp_value(&value)).transpose()?;
+    let csp_override = csp_override
+        .map(|value| parse_csp_value(&value))
+        .transpose()?;
 
     Ok(RedirectRule::new(
         host,
@@ -214,7 +226,6 @@ fn expand_expr(expr: &str, rule_index: usize, field: &str) -> Result<String, Str
         Err(err @ std::env::VarError::NotUnicode(_)) => Err(err.to_string()),
     }
 }
-
 
 /// Parse the CSP override value shared by the CLI flag and config entries:
 /// `off` removes the header, any other string replaces it.
@@ -514,7 +525,14 @@ csp_override = "frame-ancestors *\nX-Evil: y"
     }
 
     fn rule(host: &str, path: &str) -> RedirectRule {
-        RedirectRule::new(host.into(), path.into(), "http://127.0.0.1:1111".into(), None, true, false)
+        RedirectRule::new(
+            host.into(),
+            path.into(),
+            "http://127.0.0.1:1111".into(),
+            None,
+            true,
+            false,
+        )
     }
 
     #[test]
@@ -529,7 +547,10 @@ csp_override = "frame-ancestors *\nX-Evil: y"
 
     #[test]
     fn shadowing_is_detected_for_duplicate_rules() {
-        let rules = vec![rule("app.example.com", "/api/"), rule("app.example.com", "/api/")];
+        let rules = vec![
+            rule("app.example.com", "/api/"),
+            rule("app.example.com", "/api/"),
+        ];
 
         assert_eq!(shadowed_pairs(&rules), vec![(0, 1)]);
     }
@@ -559,7 +580,10 @@ csp_override = "frame-ancestors *\nX-Evil: y"
     #[test]
     fn prefix_paths_of_same_host_are_comparable() {
         // "/app" prefix covers "/apple" too — the later rule is unreachable.
-        let rules = vec![rule("app.example.com", "/app"), rule("app.example.com", "/apple")];
+        let rules = vec![
+            rule("app.example.com", "/app"),
+            rule("app.example.com", "/apple"),
+        ];
 
         assert_eq!(shadowed_pairs(&rules), vec![(0, 1)]);
     }
@@ -567,7 +591,10 @@ csp_override = "frame-ancestors *\nX-Evil: y"
     #[test]
     fn shorter_but_not_prefix_path_is_silent() {
         // "/api/" does not cover "/api" (no trailing slash in the later rule).
-        let rules = vec![rule("app.example.com", "/api/"), rule("app.example.com", "/api")];
+        let rules = vec![
+            rule("app.example.com", "/api/"),
+            rule("app.example.com", "/api"),
+        ];
 
         assert!(shadowed_pairs(&rules).is_empty());
     }
@@ -632,7 +659,10 @@ target = "http://127.0.0.1:8124"
         );
 
         // Empty value with no default expands to empty, without an error.
-        assert_eq!(interpolate_field("x${REXY_TEST_EMPTY}y", 0, "path").unwrap(), "xy");
+        assert_eq!(
+            interpolate_field("x${REXY_TEST_EMPTY}y", 0, "path").unwrap(),
+            "xy"
+        );
 
         // Unset without default — error naming the variable, rule and field.
         let err = interpolate_field("${REXY_TEST_UNSET}", 2, "target").unwrap_err();
@@ -641,9 +671,18 @@ target = "http://127.0.0.1:8124"
         assert!(err.contains("target"), "{err}");
 
         // Bare $VAR is NOT interpolated; $ outside ${...} is literal.
-        assert_eq!(interpolate_field("$REXY_TEST_HOST", 0, "path").unwrap(), "$REXY_TEST_HOST");
-        assert_eq!(interpolate_field("price $5", 0, "path").unwrap(), "price $5");
-        assert_eq!(interpolate_field("trailing $", 0, "path").unwrap(), "trailing $");
+        assert_eq!(
+            interpolate_field("$REXY_TEST_HOST", 0, "path").unwrap(),
+            "$REXY_TEST_HOST"
+        );
+        assert_eq!(
+            interpolate_field("price $5", 0, "path").unwrap(),
+            "price $5"
+        );
+        assert_eq!(
+            interpolate_field("trailing $", 0, "path").unwrap(),
+            "trailing $"
+        );
 
         // `$$` escapes a literal `$`; `$${VAR}` stays literal `${VAR}`.
         assert_eq!(interpolate_field("$$8123", 0, "path").unwrap(), "$8123");
@@ -661,8 +700,14 @@ target = "http://127.0.0.1:8124"
     #[test]
     fn interpolation_neutral_without_dollar() {
         // Configs without `${…}` parse exactly as before.
-        assert_eq!(interpolate_field("app.example.com", 0, "host").unwrap(), "app.example.com");
-        assert_eq!(interpolate_field("/api/v1/", 3, "path").unwrap(), "/api/v1/");
+        assert_eq!(
+            interpolate_field("app.example.com", 0, "host").unwrap(),
+            "app.example.com"
+        );
+        assert_eq!(
+            interpolate_field("/api/v1/", 3, "path").unwrap(),
+            "/api/v1/"
+        );
         assert_eq!(interpolate_field("", 0, "csp_override").unwrap(), "");
     }
 

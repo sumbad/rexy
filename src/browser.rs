@@ -99,16 +99,11 @@ impl Browser {
         pac_url: &str,
         browser_args: &[String],
     ) -> Result<Child, Box<dyn std::error::Error>> {
-        let profile = std::env::temp_dir().join(format!(
-            "rexy-firefox-profile-{}",
-            std::process::id()
-        ));
+        let profile =
+            std::env::temp_dir().join(format!("rexy-firefox-profile-{}", std::process::id()));
         std::fs::create_dir_all(&profile)?;
 
-        std::fs::write(
-            profile.join("user.js"),
-            firefox_user_js(pac_url),
-        )?;
+        std::fs::write(profile.join("user.js"), firefox_user_js(pac_url))?;
 
         let mut command = Command::new(&self.executable);
 
@@ -165,7 +160,11 @@ fn find_firefox() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
     #[cfg(target_os = "linux")]
     {
-        for candidate in ["/usr/bin/firefox", "/usr/bin/firefox-esr", "/snap/bin/firefox"] {
+        for candidate in [
+            "/usr/bin/firefox",
+            "/usr/bin/firefox-esr",
+            "/snap/bin/firefox",
+        ] {
             if Path::new(candidate).exists() {
                 return Ok(PathBuf::from(candidate));
             }
