@@ -41,7 +41,9 @@ pub struct Event {
     pub id: u64,
     /// Epoch milliseconds.
     pub ts: u64,
-    /// `connect`, `request` or `response`.
+    /// `connect` or `request`. Responses never emit a separate event — they
+    /// fill the `status`/`duration_ms` fields of the matching request event
+    /// in place and re-notify its id.
     pub kind: &'static str,
     pub host: String,
     /// Request path (empty for connects).
@@ -278,6 +280,8 @@ new EventSource("/stream").onmessage = m => render(JSON.parse(m.data));
 /// Serve the status endpoints on `listener` until the process exits:
 /// `GET /` — HTML page, `GET /events` — JSON snapshot, `GET /stream` — SSE.
 pub async fn serve(listener: TcpListener, log: Arc<EventLog>) {
+    let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
+
     loop {
         let Ok((socket, _)) = listener.accept().await else {
             continue;
@@ -285,14 +289,22 @@ pub async fn serve(listener: TcpListener, log: Arc<EventLog>) {
 
         let log = Arc::clone(&log);
         tokio::spawn(async move {
-            if let Err(err) = handle(socket, log).await {
+            if let Err(err) = handle(socket, log, port).await {
                 tracing::debug!(?err, "status server connection ended");
             }
         });
     }
 }
 
-async fn handle(mut socket: TcpStream, log: Arc<EventLog>) -> std::io::Result<()> {
+/// The `Host` header value of a raw request, if present.
+fn request_host_header(request: &str) -> Option<&str> {
+    request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("host").then(|| value.trim())
+    })
+}
+
+async fn handle(mut socket: TcpStream, log: Arc<EventLog>, bound_port: u16) -> std::io::Result<()> {
     let mut buf = [0u8; 2048];
     let mut seen = 0usize;
 
@@ -308,6 +320,23 @@ async fn handle(mut socket: TcpStream, log: Arc<EventLog>) -> std::io::Result<()
     }
 
     let request = String::from_utf8_lossy(&buf[..seen]);
+
+    // DNS rebinding guard: the status server is a localhost diagnostic that
+    // exposes the rule decisions, so only the addresses it is bound to may
+    // address it. A page from any other origin (its host resolved to
+    // 127.0.0.1 by a rebinding attack) is refused before any body is sent.
+    let allowed_hosts = [
+        format!("127.0.0.1:{bound_port}"),
+        format!("localhost:{bound_port}"),
+    ];
+    if !request_host_header(&request).is_some_and(|host| allowed_hosts.contains(&host.to_string()))
+    {
+        socket
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await?;
+        return Ok(());
+    }
+
     let path = request
         .lines()
         .next()
@@ -511,7 +540,13 @@ mod tests {
 
         let mut socket = TcpStream::connect(addr).await.unwrap();
         socket
-            .write_all(b"GET /events HTTP/1.1\r\nHost: x\r\n\r\n")
+            .write_all(
+                format!(
+                    "GET /events HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+                    addr.port()
+                )
+                .as_bytes(),
+            )
             .await
             .unwrap();
         let mut response = String::new();
@@ -523,13 +558,51 @@ mod tests {
 
         let mut socket = TcpStream::connect(addr).await.unwrap();
         socket
-            .write_all(b"GET /nope HTTP/1.1\r\nHost: x\r\n\r\n")
+            .write_all(
+                format!(
+                    "GET /nope HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+                    addr.port()
+                )
+                .as_bytes(),
+            )
             .await
             .unwrap();
         let mut response = String::new();
         socket.read_to_string(&mut response).await.unwrap();
 
         assert!(response.contains("404"));
+    }
+
+    #[tokio::test]
+    async fn foreign_host_header_is_rejected() {
+        let log = EventLog::new();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, Arc::clone(&log)));
+
+        // A rebinding-style request: the page origin claims a different host.
+        let mut socket = TcpStream::connect(addr).await.unwrap();
+        socket
+            .write_all(b"GET /events HTTP/1.1\r\nHost: evil.example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        socket.read_to_string(&mut response).await.unwrap();
+
+        assert!(response.contains("403"), "{response}");
+        assert!(!response.contains("a.example.com"), "{response}");
+
+        // No Host header at all is equally refused.
+        let mut socket = TcpStream::connect(addr).await.unwrap();
+        socket
+            .write_all(b"GET /events HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        socket.read_to_string(&mut response).await.unwrap();
+
+        assert!(response.contains("403"), "{response}");
     }
 
     #[tokio::test]
@@ -550,7 +623,13 @@ mod tests {
 
         let mut socket = TcpStream::connect(addr).await.unwrap();
         socket
-            .write_all(b"GET /stream HTTP/1.1\r\nHost: x\r\n\r\n")
+            .write_all(
+                format!(
+                    "GET /stream HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+                    addr.port()
+                )
+                .as_bytes(),
+            )
             .await
             .unwrap();
 
