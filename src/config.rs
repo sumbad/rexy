@@ -283,13 +283,18 @@ pub fn validate_host(host: &str) -> Result<(), Box<dyn std::error::Error>> {
     // WHY: the host is embedded into generated PAC JavaScript (pac.rs builds
     // `host === "<host>"` conditions) — quotes, backslashes or braces there
     // would allow injecting arbitrary code into FindProxyForURL. Domain
-    // names, including punycode `xn--` labels, are fully covered by this
-    // whitelist.
+    // names (including punycode `xn--` labels and the underscore labels
+    // common in internal DNS) are fully covered by this whitelist, and an
+    // underscore is inert inside the double-quoted JS string.
     if !host
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
     {
-        return Err("host may only contain ASCII letters, digits, dots and dashes".into());
+        return Err(
+            "host may only contain ASCII letters, digits, dots, dashes and underscores \
+             (IPv6 literals are not supported)"
+                .into(),
+        );
     }
 
     Ok(())
@@ -544,21 +549,41 @@ target = "http://127.0.0.1:1111"
             "a.example.com\\",
             "a.example.com${x}",
             "a example.com",
-            "a_example.com",
             "a@example.com",
             "a.example.com:443",
+            "a.example.com'",
         ] {
             assert!(validate_host(bad).is_err(), "{bad} must be rejected");
         }
 
-        // Real-world hostnames pass: subdomains, punycode, dashes.
+        // Real-world hostnames pass: subdomains, punycode, dashes and the
+        // underscore labels common in internal DNS (inert in the JS string).
         for good in [
             "a.example.com",
             "xn--80ak6aa92e.example",
             "my-team.internal",
+            "my_host.internal",
         ] {
             assert!(validate_host(good).is_ok(), "{good} must be accepted");
         }
+    }
+
+    #[test]
+    fn underscore_host_loads_and_matches() {
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "my_host.internal"
+target = "http://127.0.0.1:1111"
+"#,
+        );
+
+        let rules = load_rules(&path).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].host(), "my_host.internal");
+        assert!(rules[0].matches("my_host.internal", "/"));
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
