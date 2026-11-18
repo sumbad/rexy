@@ -297,15 +297,17 @@ impl DevRedirect {
             .any(|rule| rule.intercept() && rule.matches_host(host))
     }
 
-    /// TLS interception decision for an SNI host: decrypt only when some rule
-    /// for the host asks to intercept. With no such rule the CONNECT is
-    /// tunneled as-is and only a CONNECT line shows up in the logs.
-    fn should_intercept(&self, server_name: &str) -> bool {
+    /// Index of the first interceptable rule matching the host, so the
+    /// CONNECT status event names the rule that actually decided. `None`
+    /// means the host is tunneled untouched (no interceptable rule).
+    fn intercept_rule_index(&self, server_name: &str) -> Option<usize> {
         self.rules
             .read()
             .expect("rules lock is poisoned")
             .iter()
-            .any(|rule| rule.intercept() && rule.matches_host(server_name))
+            .enumerate()
+            .find(|(_, rule)| rule.intercept() && rule.matches_host(server_name))
+            .map(|(index, _)| index)
     }
 }
 
@@ -325,13 +327,13 @@ impl HttpHandler for DevRedirect {
             return false;
         };
 
-        let intercept = self.should_intercept(server_name);
+        let rule_index = self.intercept_rule_index(server_name);
 
-        if intercept {
+        if let Some(rule_index) = rule_index {
             self.events.record_connect(
                 server_name,
                 Decision::Matched {
-                    rule_index: 0,
+                    rule_index,
                     target: "(TLS decrypted)".into(),
                 },
             );
@@ -350,7 +352,7 @@ impl HttpHandler for DevRedirect {
             );
         }
 
-        intercept
+        rule_index.is_some()
     }
 
     async fn handle_request(
@@ -368,7 +370,40 @@ impl HttpHandler for DevRedirect {
 
 impl DevRedirect {
     fn handle_request_inner(&mut self, mut req: Request<Body>) -> RequestOrResponse {
+        // CONNECT arrives in authority-form (`Uri::path()` is empty), so the
+        // generic path below would emit a phantom "miss: no rule matched the
+        // path" request event for every tunnel. CONNECT decisions are
+        // reported by `should_intercept_tls` only; hudsucker tunnels the
+        // request as-is.
+        if req.method() == hudsucker::hyper::Method::CONNECT {
+            return RequestOrResponse::Request(req);
+        }
+
+        let method = req.method().to_string();
+        let host = Self::request_host(&req).unwrap_or_default();
+        let path = req.uri().path().to_string();
+
+        // Replay from fixtures has priority over the rules: an offline smoke
+        // must not touch the network. The original prod URL is the key.
         if let Some(response) = self.replay_response(&req) {
+            // The hit is its own outcome: report it like a matched decision
+            // with a synthetic target, and close the event out immediately —
+            // `handle_response` never sees a replayed answer.
+            let started_ms = now_ms();
+            let event_id = self.events.record_request(
+                &method,
+                &host,
+                &path,
+                Decision::Matched {
+                    rule_index: 0,
+                    target: "(replay)".into(),
+                },
+            );
+            self.events.record_response(
+                event_id,
+                response.status().as_u16(),
+                now_ms().saturating_sub(started_ms),
+            );
             return RequestOrResponse::Response(response);
         }
 
@@ -384,9 +419,6 @@ impl DevRedirect {
             "HTTP request"
         );
 
-        let host = Self::request_host(&req).unwrap_or_default();
-        let path = req.uri().path().to_string();
-        let method = req.method().to_string();
         let started_ms = now_ms();
 
         let Some((rule_index, rule)) = matched else {
@@ -397,15 +429,17 @@ impl DevRedirect {
             } else {
                 "host not configured"
             };
+            // With replay active, a plain miss reads like a misconfigured
+            // rule — say that the fixtures were consulted first.
+            let reason = if self.replayer.is_some() {
+                format!("{reason}; no fixture; fell through to rules")
+            } else {
+                reason.to_string()
+            };
 
-            let event_id = self.events.record_request(
-                &method,
-                &host,
-                &path,
-                Decision::Missed {
-                    reason: reason.into(),
-                },
-            );
+            let event_id =
+                self.events
+                    .record_request(&method, &host, &path, Decision::Missed { reason });
             self.pending = Some(Pending {
                 event_id,
                 started_ms,
@@ -1061,8 +1095,8 @@ mod tests {
             false,
         )]);
 
-        assert!(h.should_intercept("example.com"));
-        assert!(!h.should_intercept("other.com"));
+        assert!(h.intercept_rule_index("example.com").is_some());
+        assert!(!h.intercept_rule_index("other.com").is_some());
     }
 
     #[test]
@@ -1076,10 +1110,62 @@ mod tests {
             false,
         )]);
 
-        assert!(!h.should_intercept("pinned.example.com"));
+        assert!(!h.intercept_rule_index("pinned.example.com").is_some());
         // The host is still known to the PAC (routed via the proxy), it is
         // only tunneled instead of decrypted.
         assert!(h.matches_any_host("pinned.example.com"));
+    }
+
+    #[test]
+    fn connect_event_names_the_deciding_rule_index() {
+        let h = DevRedirect::new(vec![
+            RedirectRule::new(
+                "example.com".into(),
+                "/api/".into(),
+                "http://127.0.0.1:1111".into(),
+                None,
+                false,
+                false,
+            ),
+            RedirectRule::new(
+                "example.com".into(),
+                "/".into(),
+                "http://127.0.0.1:2222".into(),
+                None,
+                true,
+                false,
+            ),
+        ]);
+
+        // The second rule is the one that asks to intercept — the CONNECT
+        // event must name it, not a literal rule #1.
+        assert_eq!(h.intercept_rule_index("example.com"), Some(1));
+        assert_eq!(h.intercept_rule_index("other.com"), None);
+    }
+
+    #[tokio::test]
+    async fn connect_request_does_not_emit_a_request_event() {
+        let mut h = handler(Some(CspOverride::Off));
+
+        let req = Request::builder()
+            .method("CONNECT")
+            .uri("example.com:443")
+            .body(Body::empty())
+            .unwrap();
+
+        // CONNECT is authority-form and tunneled by hudsucker before any
+        // rule matching: the handler must pass it through untouched and
+        // must not record a phantom request event.
+        let RequestOrResponse::Request(returned) = h.handle_request_inner(req) else {
+            panic!("CONNECT must be passed through, not answered");
+        };
+        assert_eq!(returned.uri().to_string(), "example.com:443");
+
+        let events = h.events_handle().snapshot();
+        assert!(
+            events.is_empty(),
+            "CONNECT must not produce request events, got {events:?}"
+        );
     }
 
     #[test]
@@ -1125,7 +1211,7 @@ mod tests {
             ),
         ]);
 
-        assert!(h.should_intercept("example.com"));
+        assert!(h.intercept_rule_index("example.com").is_some());
     }
 
     #[tokio::test]
@@ -1625,6 +1711,65 @@ mod tests {
         assert_eq!(res.status(), 304);
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         assert!(bytes.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn replay_hit_is_visible_in_the_status_feed() {
+        let dir = temp_dir("replay-hit");
+        std::fs::create_dir_all(&dir).unwrap();
+        let har_path = dir.join("session.har");
+        let raw = r#"{"log":{"version":"1.2","creator":{"name":"x","version":"1"},"entries":[{"startedDateTime":"2026-01-01T00:00:00.000Z","time":0,"request":{"method":"GET","url":"https://a.example.com/x","httpVersion":"HTTP/1.1","headers":[],"queryString":[],"cookies":[],"headersSize":-1,"bodySize":-1},"response":{"status":200,"statusText":"","httpVersion":"HTTP/1.1","headers":[],"content":{"size":2,"mimeType":"text/plain","text":"aGk=","encoding":"base64"},"headersSize":-1,"bodySize":2}}]}}"#;
+        std::fs::write(&har_path, raw).unwrap();
+
+        let replayer = Replayer::open(&har_path).unwrap();
+        let mut h = DevRedirect::with_fixtures(vec![], None, Some(std::sync::Arc::new(replayer)));
+
+        let outcome = h.handle_request_inner(request_to("a.example.com", "/x"));
+        assert!(matches!(outcome, RequestOrResponse::Response(_)));
+
+        let events = h.events_handle().snapshot();
+        assert_eq!(events.len(), 1, "replay hit must emit one event");
+        assert_eq!(events[0].kind, "request");
+        assert_eq!(events[0].method, "GET");
+        assert_eq!(
+            events[0].status,
+            Some(200),
+            "hit closes with the fixture status"
+        );
+        assert!(matches!(
+            &events[0].decision,
+            Some(Decision::Matched { rule_index: 0, target })
+                if target == "(replay)"
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn replay_miss_reason_mentions_fixtures() {
+        let dir = temp_dir("replay-miss");
+        std::fs::create_dir_all(&dir).unwrap();
+        let har_path = dir.join("session.har");
+        // One entry for a URL the request below will not use.
+        let raw = r#"{"log":{"version":"1.2","creator":{"name":"x","version":"1"},"entries":[{"startedDateTime":"2026-01-01T00:00:00.000Z","time":0,"request":{"method":"GET","url":"https://a.example.com/other","httpVersion":"HTTP/1.1","headers":[],"queryString":[],"cookies":[],"headersSize":-1,"bodySize":-1},"response":{"status":200,"statusText":"","httpVersion":"HTTP/1.1","headers":[],"content":{"size":0,"mimeType":"text/plain"},"headersSize":-1,"bodySize":0}}]}}"#;
+        std::fs::write(&har_path, raw).unwrap();
+
+        let replayer = Replayer::open(&har_path).unwrap();
+        // No rules at all: the request misses both the fixtures and the rules.
+        let mut h = DevRedirect::with_fixtures(vec![], None, Some(std::sync::Arc::new(replayer)));
+
+        let outcome = h.handle_request_inner(request_to("a.example.com", "/x"));
+        assert!(matches!(outcome, RequestOrResponse::Request(_)));
+
+        let events = h.events_handle().snapshot();
+        assert_eq!(events.len(), 1);
+        let Some(Decision::Missed { reason }) = &events[0].decision else {
+            panic!("expected a missed decision, got {:?}", events[0].decision);
+        };
+        assert!(reason.contains("no fixture"), "{reason}");
+        assert!(reason.contains("host not configured"), "{reason}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
