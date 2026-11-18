@@ -75,7 +75,7 @@ enum RulesCommand {
 
 #[derive(Debug, Parser)]
 struct RunArgs {
-    /// Browser to launch: chrome, chromium, or an executable path.
+    /// Browser to launch: chrome, chromium, firefox, or an executable path.
     #[arg(long, default_value = "chrome")]
     browser: String,
 
@@ -259,6 +259,11 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             info!(
                 har = %recorder.path().display(),
                 "recording intercepted exchanges"
+            );
+            tracing::warn!(
+                "the recorded HAR contains request and response headers (cookies, \
+                 authorization) and bodies in plaintext — keep the record dir private \
+                 and delete it when the smoke run is done"
             );
             DevRedirect::with_fixtures(rules, Some(std::sync::Arc::new(recorder)), None)
         }
