@@ -368,7 +368,7 @@ impl HttpHandler for DevRedirect {
         _ctx: &HttpContext,
         req: Request<Body>,
     ) -> RequestOrResponse {
-        self.handle_request_inner(req)
+        self.handle_request_inner(req).await
     }
 
     async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
@@ -377,7 +377,7 @@ impl HttpHandler for DevRedirect {
 }
 
 impl DevRedirect {
-    fn handle_request_inner(&mut self, mut req: Request<Body>) -> RequestOrResponse {
+    async fn handle_request_inner(&mut self, mut req: Request<Body>) -> RequestOrResponse {
         // CONNECT arrives in authority-form (`Uri::path()` is empty), so the
         // generic path below would emit a phantom "miss: no rule matched the
         // path" request event for every tunnel. CONNECT decisions are
@@ -477,7 +477,23 @@ impl DevRedirect {
         // response edits, outcome and HAR entry are recorded here too —
         // `handle_response` never sees it.
         if rule.is_file_target() {
-            let (mut res, file_body) = serve_from_file_target(&rule, &req);
+            let file_rule = rule.clone();
+            let file_method = req.method().clone();
+            let file_uri = req.uri().clone();
+            let (mut res, file_body) = match tokio::task::spawn_blocking(move || {
+                serve_from_file_target(&file_rule, &file_method, &file_uri)
+            })
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    tracing::error!(%err, "file target worker failed");
+                    plain_response(
+                        hudsucker::hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                        "file target error\n",
+                    )
+                }
+            };
             let edits = ResponseEdits::from_rule(&rule);
 
             if let Some(csp_override) = &edits.csp_override {
@@ -718,21 +734,25 @@ fn plain_response(status: hudsucker::hyper::StatusCode, body: &str) -> (Response
 ///
 /// Returns the response and the exact body bytes it carries (empty for HEAD
 /// and error answers), so the caller can record the exchange into the HAR.
-fn serve_from_file_target(rule: &RedirectRule, req: &Request<Body>) -> (Response<Body>, Bytes) {
+fn serve_from_file_target(
+    rule: &RedirectRule,
+    method: &hudsucker::hyper::Method,
+    uri: &hudsucker::hyper::Uri,
+) -> (Response<Body>, Bytes) {
     use hudsucker::hyper::{Method, StatusCode};
     use std::path::PathBuf;
 
     let dir = rule.file_dir().expect("file target checked by caller");
-    let head = req.method() == Method::HEAD;
+    let head = *method == Method::HEAD;
 
-    if req.method() != Method::GET && !head {
+    if *method != Method::GET && !head {
         return plain_response(
             StatusCode::METHOD_NOT_ALLOWED,
             "only GET and HEAD are served\n",
         );
     }
 
-    let Some(url_path) = percent_decode(req.uri().path()) else {
+    let Some(url_path) = percent_decode(uri.path()) else {
         return plain_response(StatusCode::BAD_REQUEST, "malformed path encoding\n");
     };
 
@@ -926,7 +946,7 @@ mod tests {
         let mut h = handler(Some(CspOverride::Off));
 
         let req = request_to("example.com", "/app.js");
-        let _ = h.handle_request_inner(req);
+        let _ = h.handle_request_inner(req).await;
 
         let res = h
             .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
@@ -940,7 +960,7 @@ mod tests {
         let mut h = handler(Some(CspOverride::Off));
 
         let req = request_to("other.com", "/app.js");
-        let _ = h.handle_request_inner(req);
+        let _ = h.handle_request_inner(req).await;
 
         let res = h
             .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
@@ -957,7 +977,7 @@ mod tests {
         let mut h = handler(None);
 
         let req = request_to("example.com", "/app.js");
-        let _ = h.handle_request_inner(req);
+        let _ = h.handle_request_inner(req).await;
 
         let res = h
             .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
@@ -992,7 +1012,7 @@ mod tests {
         let mut h = embed_handler();
 
         let req = request_to("example.com", "/app.js");
-        let _ = h.handle_request_inner(req);
+        let _ = h.handle_request_inner(req).await;
 
         let mut res = Response::new(Body::empty());
         for (name, value) in [
@@ -1033,7 +1053,7 @@ mod tests {
         let mut h = handler(None);
 
         let req = request_to("example.com", "/app.js");
-        let _ = h.handle_request_inner(req);
+        let _ = h.handle_request_inner(req).await;
 
         let mut res = Response::new(Body::empty());
         res.headers_mut().insert(
@@ -1051,7 +1071,7 @@ mod tests {
         let mut h = embed_handler();
 
         let req = request_to("other.com", "/app.js");
-        let _ = h.handle_request_inner(req);
+        let _ = h.handle_request_inner(req).await;
 
         let mut res = Response::new(Body::empty());
         res.headers_mut().insert(
@@ -1077,7 +1097,7 @@ mod tests {
         )]);
 
         let req = request_to("example.com", "/app.js");
-        let _ = h.handle_request_inner(req);
+        let _ = h.handle_request_inner(req).await;
 
         let mut res = Response::new(Body::empty());
         res.headers_mut().insert(
@@ -1167,7 +1187,7 @@ mod tests {
         // CONNECT is authority-form and tunneled by hudsucker before any
         // rule matching: the handler must pass it through untouched and
         // must not record a phantom request event.
-        let RequestOrResponse::Request(returned) = h.handle_request_inner(req) else {
+        let RequestOrResponse::Request(returned) = h.handle_request_inner(req).await else {
             panic!("CONNECT must be passed through, not answered");
         };
         assert_eq!(returned.uri().to_string(), "example.com:443");
@@ -1179,8 +1199,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn passthrough_rule_never_rewrites_requests() {
+    #[tokio::test]
+    async fn passthrough_rule_never_rewrites_requests() {
         let mut h = DevRedirect::new(vec![RedirectRule::new(
             "pinned.example.com".into(),
             "/".into(),
@@ -1192,8 +1212,9 @@ mod tests {
 
         // Plain-HTTP requests to the host reach the handler without a TLS
         // layer; they must pass through untouched as well.
-        let RequestOrResponse::Request(req) =
-            h.handle_request_inner(request_to("pinned.example.com", "/app.js"))
+        let RequestOrResponse::Request(req) = h
+            .handle_request_inner(request_to("pinned.example.com", "/app.js"))
+            .await
         else {
             panic!("passthrough rules must pass requests through untouched");
         };
@@ -1232,10 +1253,14 @@ mod tests {
         // every decrypted inner request. The clone must not inherit the
         // non-redirected outcome: its own request decides.
         let mut connect_handler = handler(Some(CspOverride::Off));
-        let _ = connect_handler.handle_request_inner(request_to("other.com", "/"));
+        let _ = connect_handler
+            .handle_request_inner(request_to("other.com", "/"))
+            .await;
 
         let mut inner = connect_handler.clone();
-        let _ = inner.handle_request_inner(request_to("example.com", "/"));
+        let _ = inner
+            .handle_request_inner(request_to("example.com", "/"))
+            .await;
 
         let res = inner
             .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
@@ -1277,8 +1302,9 @@ mod tests {
     async fn first_matching_rule_wins() {
         let mut h = multi_rule_handler();
 
-        let RequestOrResponse::Request(req) =
-            h.handle_request_inner(request_to("example.com", "/app/main.js"))
+        let RequestOrResponse::Request(req) = h
+            .handle_request_inner(request_to("example.com", "/app/main.js"))
+            .await
         else {
             panic!("redirect rules must pass the request through");
         };
@@ -1291,12 +1317,13 @@ mod tests {
         assert_eq!(res.headers()[header::CONTENT_SECURITY_POLICY], "policy-a");
     }
 
-    #[test]
-    fn redirect_uses_matched_rule_target() {
+    #[tokio::test]
+    async fn redirect_uses_matched_rule_target() {
         let mut h = multi_rule_handler();
 
-        let RequestOrResponse::Request(req) =
-            h.handle_request_inner(request_to("example.com", "/other.js"))
+        let RequestOrResponse::Request(req) = h
+            .handle_request_inner(request_to("example.com", "/other.js"))
+            .await
         else {
             panic!("redirect rules must pass the request through");
         };
@@ -1325,7 +1352,7 @@ mod tests {
         ]);
 
         let req = request_to("plain.com", "/");
-        let _ = h.handle_request_inner(req);
+        let _ = h.handle_request_inner(req).await;
 
         let res = h
             .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
@@ -1370,8 +1397,8 @@ mod tests {
         res
     }
 
-    #[test]
-    fn file_target_serves_bytes_with_mime_type() {
+    #[tokio::test]
+    async fn file_target_serves_bytes_with_mime_type() {
         let dir = std::env::temp_dir().join(format!("rexy-maplocal-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("app.js"), b"console.log(1)").unwrap();
@@ -1379,7 +1406,7 @@ mod tests {
 
         let mut h = file_handler(&dir);
 
-        let res = as_response(h.handle_request_inner(file_request("/app.js?v=3")));
+        let res = as_response(h.handle_request_inner(file_request("/app.js?v=3")).await);
         assert_eq!(res.status(), 200);
         assert_eq!(
             res.headers()[header::CONTENT_TYPE],
@@ -1387,7 +1414,7 @@ mod tests {
         );
         assert_eq!(res.headers()[header::CONTENT_LENGTH], "14");
 
-        let res = as_response(h.handle_request_inner(file_request("/page.html")));
+        let res = as_response(h.handle_request_inner(file_request("/page.html")).await);
         assert_eq!(
             res.headers()[header::CONTENT_TYPE],
             "text/html; charset=utf-8"
@@ -1396,25 +1423,44 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn file_target_missing_file_is_404() {
+    #[tokio::test]
+    async fn file_target_missing_file_is_404() {
         let dir = std::env::temp_dir().join(format!("rexy-maplocal-404-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut h = file_handler(&dir);
 
-        let res = as_response(h.handle_request_inner(file_request("/nope.js")));
+        let res = as_response(h.handle_request_inner(file_request("/nope.js")).await);
         assert_eq!(res.status(), 404);
 
         // Directories are not listed, including the root.
-        let res = as_response(h.handle_request_inner(file_request("/")));
+        let res = as_response(h.handle_request_inner(file_request("/")).await);
         assert_eq!(res.status(), 404);
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn file_target_rejects_traversal() {
+    #[tokio::test]
+    async fn file_target_keeps_rule_prefix_in_disk_path() {
+        let dir = temp_dir("file-prefix");
+        std::fs::create_dir_all(dir.join("static")).unwrap();
+        std::fs::write(dir.join("static/app.js"), b"prefix retained").unwrap();
+        let mut h = DevRedirect::new(vec![RedirectRule::new(
+            "assets.example.com".into(),
+            "/static/".into(),
+            format!("file:{}", dir.display()),
+            None,
+            true,
+            false,
+        )]);
+        let res = as_response(h.handle_request_inner(file_request("/static/app.js")).await);
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()[header::CONTENT_LENGTH], "15");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn file_target_rejects_traversal() {
         let dir = std::env::temp_dir().join(format!("rexy-maplocal-trav-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("ok.txt"), b"ok").unwrap();
@@ -1427,7 +1473,7 @@ mod tests {
             "/a/../../secret.txt",
             "/%2e%2e/secret.txt",
         ] {
-            let res = as_response(h.handle_request_inner(file_request(path)));
+            let res = as_response(h.handle_request_inner(file_request(path)).await);
             assert_eq!(res.status(), 403, "path {path} must be rejected");
         }
 
@@ -1435,8 +1481,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn file_target_rejects_symlink_escape() {
+    #[tokio::test]
+    async fn file_target_rejects_symlink_escape() {
         use std::os::unix::fs::symlink;
 
         let dir = temp_dir("file-symlink");
@@ -1453,13 +1499,13 @@ mod tests {
 
         let mut h = file_handler(&dir);
 
-        let res = as_response(h.handle_request_inner(file_request("/escape.txt")));
+        let res = as_response(h.handle_request_inner(file_request("/escape.txt")).await);
         assert_eq!(res.status(), 403);
 
         // A symlink staying inside the directory still serves.
         std::fs::write(dir.join("real.txt"), b"real").unwrap();
         symlink(dir.join("real.txt"), dir.join("alias.txt")).unwrap();
-        let res = as_response(h.handle_request_inner(file_request("/alias.txt")));
+        let res = as_response(h.handle_request_inner(file_request("/alias.txt")).await);
         assert_eq!(res.status(), 200);
         assert_eq!(res.headers()[header::CONTENT_LENGTH], "4");
 
@@ -1467,15 +1513,15 @@ mod tests {
         std::fs::remove_dir_all(&outside).ok();
     }
 
-    #[test]
-    fn file_target_decodes_percent_escapes() {
+    #[tokio::test]
+    async fn file_target_decodes_percent_escapes() {
         let dir = std::env::temp_dir().join(format!("rexy-maplocal-esc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("my file.txt"), b"hello").unwrap();
 
         let mut h = file_handler(&dir);
 
-        let res = as_response(h.handle_request_inner(file_request("/my%20file.txt")));
+        let res = as_response(h.handle_request_inner(file_request("/my%20file.txt")).await);
         assert_eq!(res.status(), 200);
         assert_eq!(
             res.headers()[header::CONTENT_TYPE],
@@ -1485,8 +1531,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn file_target_head_returns_headers_without_body() {
+    #[tokio::test]
+    async fn file_target_head_returns_headers_without_body() {
         let dir = std::env::temp_dir().join(format!("rexy-maplocal-head-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("app.js"), b"console.log(1)").unwrap();
@@ -1500,15 +1546,15 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let res = as_response(h.handle_request_inner(req));
+        let res = as_response(h.handle_request_inner(req).await);
         assert_eq!(res.status(), 200);
         assert_eq!(res.headers()[header::CONTENT_LENGTH], "14");
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn file_target_post_is_method_not_allowed() {
+    #[tokio::test]
+    async fn file_target_post_is_method_not_allowed() {
         let dir = std::env::temp_dir().join(format!("rexy-maplocal-post-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -1521,14 +1567,14 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let res = as_response(h.handle_request_inner(req));
+        let res = as_response(h.handle_request_inner(req).await);
         assert_eq!(res.status(), 405);
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn file_target_applies_csp_override() {
+    #[tokio::test]
+    async fn file_target_applies_csp_override() {
         let dir = std::env::temp_dir().join(format!("rexy-maplocal-csp-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("app.js"), b"console.log(1)").unwrap();
@@ -1542,7 +1588,7 @@ mod tests {
             false,
         )]);
 
-        let res = as_response(h.handle_request_inner(file_request("/app.js")));
+        let res = as_response(h.handle_request_inner(file_request("/app.js")).await);
         assert_eq!(res.status(), 200);
         assert!(!res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
 
@@ -1591,12 +1637,14 @@ mod tests {
             .header(header::HOST, "example.com")
             .body(Body::empty())
             .unwrap();
-        let _ = h.handle_request_inner(req);
+        let _ = h.handle_request_inner(req).await;
 
         let res = h
             .handle_response_inner(
                 Response::builder()
                     .status(201)
+                    .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                    .header(header::CONTENT_LENGTH, "7")
                     .body(Body::from("created"))
                     .unwrap(),
             )
@@ -1609,6 +1657,10 @@ mod tests {
         recorder.flush().unwrap();
 
         let replayer = Replayer::open(&record_dir.join("rexy-session.har")).unwrap();
+        let recorded = replayer
+            .lookup("POST", "https://example.com/api/submit")
+            .unwrap();
+        assert_eq!(recorded.content.mime_type, "text/plain; charset=utf-8");
         assert!(
             replayer
                 .lookup("POST", "https://example.com/api/submit")
@@ -1620,6 +1672,26 @@ mod tests {
                 .lookup("GET", "https://example.com/api/submit")
                 .is_none(),
             "method must not be dropped from the HAR"
+        );
+
+        let mut replay_handler =
+            DevRedirect::with_fixtures(vec![], None, Some(std::sync::Arc::new(replayer)));
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://example.com/api/submit")
+            .header(header::HOST, "example.com")
+            .body(Body::empty())
+            .unwrap();
+        let response = as_response(replay_handler.handle_request_inner(request).await);
+        assert_eq!(response.status(), 201);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "7");
+        assert_eq!(
+            &response.into_body().collect().await.unwrap().to_bytes()[..],
+            b"created"
         );
 
         std::fs::remove_dir_all(&record_dir).ok();
@@ -1661,7 +1733,9 @@ mod tests {
             None,
         );
 
-        let _ = h.handle_request_inner(request_to("example.com", "/stream"));
+        let _ = h
+            .handle_request_inner(request_to("example.com", "/stream"))
+            .await;
 
         let res = Response::builder()
             .status(200)
@@ -1699,7 +1773,7 @@ mod tests {
             None,
         );
 
-        let res = as_response(h.handle_request_inner(file_request("/app.js")));
+        let res = as_response(h.handle_request_inner(file_request("/app.js")).await);
         assert_eq!(res.status(), 200);
 
         let head_req = Request::builder()
@@ -1708,7 +1782,7 @@ mod tests {
             .header(header::HOST, "assets.example.com")
             .body(Body::empty())
             .unwrap();
-        let res = as_response(h.handle_request_inner(head_req));
+        let res = as_response(h.handle_request_inner(head_req).await);
         assert_eq!(res.status(), 200);
 
         recorder.flush().unwrap();
@@ -1746,7 +1820,9 @@ mod tests {
         let replayer = Replayer::open(&har_path).unwrap();
         let mut h = DevRedirect::with_fixtures(vec![], None, Some(std::sync::Arc::new(replayer)));
 
-        let outcome = h.handle_request_inner(request_to("a.example.com", "/x"));
+        let outcome = h
+            .handle_request_inner(request_to("a.example.com", "/x"))
+            .await;
         let res = match outcome {
             RequestOrResponse::Response(res) => res,
             RequestOrResponse::Request(_) => panic!("replay must answer with a response"),
@@ -1770,7 +1846,9 @@ mod tests {
         let replayer = Replayer::open(&har_path).unwrap();
         let mut h = DevRedirect::with_fixtures(vec![], None, Some(std::sync::Arc::new(replayer)));
 
-        let outcome = h.handle_request_inner(request_to("a.example.com", "/x"));
+        let outcome = h
+            .handle_request_inner(request_to("a.example.com", "/x"))
+            .await;
         assert!(matches!(outcome, RequestOrResponse::Response(_)));
 
         let events = h.events_handle().snapshot();
@@ -1804,7 +1882,9 @@ mod tests {
         // No rules at all: the request misses both the fixtures and the rules.
         let mut h = DevRedirect::with_fixtures(vec![], None, Some(std::sync::Arc::new(replayer)));
 
-        let outcome = h.handle_request_inner(request_to("a.example.com", "/x"));
+        let outcome = h
+            .handle_request_inner(request_to("a.example.com", "/x"))
+            .await;
         assert!(matches!(outcome, RequestOrResponse::Request(_)));
 
         let events = h.events_handle().snapshot();
@@ -1843,7 +1923,9 @@ mod tests {
 
         // The fixture wins over the rule: the answer never reaches the
         // target and is not a rewritten request.
-        let outcome = h.handle_request_inner(request_to("a.example.com", "/fixed"));
+        let outcome = h
+            .handle_request_inner(request_to("a.example.com", "/fixed"))
+            .await;
         let res = match outcome {
             RequestOrResponse::Response(res) => res,
             RequestOrResponse::Request(_) => {
@@ -1853,7 +1935,9 @@ mod tests {
         assert_eq!(res.status(), 200);
 
         // No fixture for this URL: the usual rules apply.
-        let outcome = h.handle_request_inner(request_to("a.example.com", "/unmatched"));
+        let outcome = h
+            .handle_request_inner(request_to("a.example.com", "/unmatched"))
+            .await;
         let RequestOrResponse::Request(req) = outcome else {
             panic!("a replay miss must fall through to the rules");
         };

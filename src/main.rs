@@ -118,7 +118,7 @@ struct RunArgs {
     no_hot_reload: bool,
 
     /// Browser arguments after `--`.
-    #[arg(last = true, trailing_var_arg = true)]
+    #[arg(last = true)]
     browser_args: Vec<String>,
 }
 
@@ -378,7 +378,7 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let mut child = browser.spawn(&pac_url, &args.browser_args)?;
+    let (mut child, _temporary_profile) = browser.spawn(&pac_url, &args.browser_args)?;
 
     info!("browser started");
     info!("press Ctrl+C to stop");
@@ -648,6 +648,16 @@ mod tests {
         args.host = Some("a.example.com".into());
 
         assert!(resolve_rules(&args).is_err());
+    }
+
+    #[test]
+    fn run_accepts_browser_arguments_after_separator() {
+        let cli = Cli::try_parse_from(["rexy", "run", "--", "--user-data-dir=/tmp/test", "--flag"])
+            .unwrap();
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected run")
+        };
+        assert_eq!(args.browser_args, ["--user-data-dir=/tmp/test", "--flag"]);
     }
 
     #[test]

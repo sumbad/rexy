@@ -17,6 +17,16 @@ pub struct Browser {
     kind: Kind,
 }
 
+pub struct TemporaryProfile(PathBuf);
+
+impl Drop for TemporaryProfile {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::remove_dir_all(&self.0) {
+            tracing::warn!(path = %self.0.display(), %err, "failed to remove temporary Firefox profile");
+        }
+    }
+}
+
 pub fn resolve_browser(value: &str) -> Result<Browser, Box<dyn std::error::Error>> {
     let (executable, kind) = match value {
         "chrome" => (find_chrome()?, Kind::Chromium),
@@ -60,7 +70,7 @@ impl Browser {
         &self,
         pac_url: &str,
         browser_args: &[String],
-    ) -> Result<Child, Box<dyn std::error::Error>> {
+    ) -> Result<(Child, Option<TemporaryProfile>), Box<dyn std::error::Error>> {
         tracing::info!(
             executable = %self.executable.display(),
             pac_url = %pac_url,
@@ -68,7 +78,9 @@ impl Browser {
         );
 
         match self.kind {
-            Kind::Chromium => self.spawn_chromium(pac_url, browser_args),
+            Kind::Chromium => self
+                .spawn_chromium(pac_url, browser_args)
+                .map(|child| (child, None)),
             Kind::Firefox => self.spawn_firefox(pac_url, browser_args),
         }
     }
@@ -110,8 +122,9 @@ impl Browser {
         &self,
         pac_url: &str,
         browser_args: &[String],
-    ) -> Result<Child, Box<dyn std::error::Error>> {
-        let profile = create_firefox_profile_dir()?;
+    ) -> Result<(Child, Option<TemporaryProfile>), Box<dyn std::error::Error>> {
+        let profile_guard = TemporaryProfile(create_firefox_profile_dir()?);
+        let profile = &profile_guard.0;
 
         std::fs::write(profile.join("user.js"), firefox_user_js(pac_url))?;
 
@@ -119,7 +132,7 @@ impl Browser {
         // profile, interception fails with certificate errors on Linux /
         // older versions / enterprise policies even after `rexy trust`.
         // Best effort — a missing certutil must not stop the launch.
-        match crate::trust::import_ca_into_nss_profile(&profile) {
+        match crate::trust::import_ca_into_nss_profile(profile) {
             Ok(()) => tracing::info!(
                 profile = %profile.display(),
                 "CA imported into the throwaway Firefox profile"
@@ -136,14 +149,14 @@ impl Browser {
 
         command
             .arg("--profile")
-            .arg(&profile)
+            .arg(profile)
             .arg("-no-remote")
             .args(browser_args)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
 
-        Ok(command.spawn()?)
+        Ok((command.spawn()?, Some(profile_guard)))
     }
 }
 
@@ -151,7 +164,9 @@ impl Browser {
 /// without one, Chromium hands the command line off to an already-running
 /// instance and the proxy flags are silently ignored.
 fn isolates_profile(browser_args: &[String]) -> bool {
-    browser_args.iter().any(|arg| arg.contains("user-data-dir"))
+    browser_args
+        .iter()
+        .any(|arg| arg == "--user-data-dir" || arg.starts_with("--user-data-dir="))
 }
 
 /// Temp directory name of the throwaway Firefox profile for `nanos`/`attempt`.
@@ -342,6 +357,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn temporary_profile_is_removed_on_drop() {
+        let path = create_firefox_profile_dir().unwrap();
+        std::fs::write(path.join("user.js"), "prefs").unwrap();
+        let guard = TemporaryProfile(path.clone());
+        drop(guard);
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn user_data_dir_in_any_form_isolates_the_session() {
         let flag_value = vec!["--user-data-dir=/tmp/rexy-chrome".to_string()];
         assert!(isolates_profile(&flag_value));
@@ -357,6 +381,10 @@ mod tests {
             "https://example.com/".to_string(),
         ];
         assert!(!isolates_profile(&unrelated));
+        assert!(!isolates_profile(&["--user-data-dir-foo".into()]));
+        assert!(!isolates_profile(&[
+            "https://example.com/user-data-dir".into()
+        ]));
         assert!(!isolates_profile(&[]));
     }
 

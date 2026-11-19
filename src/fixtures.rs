@@ -196,6 +196,11 @@ impl Recorder {
             .map(|d| d.as_millis() as i64 - duration_ms)
             .unwrap_or(0);
 
+        let mime_type = response_headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case("content-type"))
+            .map(|header| header.value.clone())
+            .unwrap_or_default();
         let entry = HarEntry {
             started_date_time: iso8601_millis(started),
             time: duration_ms,
@@ -216,7 +221,7 @@ impl Recorder {
                 headers: response_headers,
                 content: HarContent {
                     size: body.len(),
-                    mime_type: String::new(),
+                    mime_type,
                     text: Some(base64::engine::general_purpose::STANDARD.encode(body)),
                     encoding: Some("base64".into()),
                 },

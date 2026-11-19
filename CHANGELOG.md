@@ -31,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Map Local file reads no longer block the asynchronous proxy worker; the full request path remains relative to the target directory.
+- `rexy run` no longer panics in debug builds when configuring browser arguments after `--`.
+- Recorded HAR responses retain their Content-Type as `content.mimeType`, and Chromium profile warnings recognize only actual `--user-data-dir` flags.
+- Temporary Firefox profiles are removed when rexy exits normally or browser startup fails.
 - **Rule matching missed HTTP/2 requests**: rules matched on the `host` header only, which HTTP/2 requests don't carry (they use the `:authority` pseudo-header). Such requests were never redirected and silently went to prod. Matching now falls back to the request URI host when the `host` header is absent.
 - **Windows: the Firefox CA import resolved `certutil` to the built-in Windows certutil.exe**: System32 is always on PATH and CreateProcess prefers it for the bare `certutil` name even when the NSS tools come later, so `clean --firefox` printed a false success and `trust --firefox` failed cryptically. The NSS `certutil.exe` is now looked up only outside the Windows system directories and invoked by its resolved absolute path; without the NSS tools rexy reports the install hint.
 - **Underscore hosts were rejected by the config validation** introduced in this release: hosts like `my_host.internal` (common in internal DNS) used to load and match; an underscore is inert in the generated PAC script and is allowed again. IPv6 literals stay unsupported and the error text says so.

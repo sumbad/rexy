@@ -242,6 +242,8 @@ target = "file:/Users/me/build/static"
 csp_override = "off"
 ```
 
+- The full request path is appended to the target directory; the rule prefix is not stripped.
+  For this example, `/static/app.js` resolves to `/Users/me/build/static/static/app.js`.
 - Content-Type is derived from the file extension (html, js, css, json, images, fonts, wasm, …); unknown extensions are served as `application/octet-stream`.
 - Missing files and directories answer `404` — no directory listing. `..` segments and symlink escapes are rejected with `403`. The query string is not part of the lookup.
 - `GET` and `HEAD` are served; other methods answer `405`.
