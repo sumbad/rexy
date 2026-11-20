@@ -1,6 +1,6 @@
 [package]
 name = "rexy"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["sumbad"]
 description = "Launch a browser with a local MITM proxy for transparent dev redirects"
