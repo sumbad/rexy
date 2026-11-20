@@ -1,18 +1,22 @@
 mod browser;
 mod ca;
 mod config;
+mod fixtures;
 mod pac;
 mod proxy_handler;
+mod rules;
+mod status;
 mod trust;
 
 use clap::{Parser, Subcommand};
 use hudsucker::Proxy;
+use rules::{CheckOutcome, RedirectRule};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
 use browser::resolve_browser;
 use hyper_rustls::ConfigBuilderExt;
-use proxy_handler::{DevRedirect, RedirectRule};
+use proxy_handler::DevRedirect;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -28,24 +32,65 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Launch the browser through the local proxy.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
 
     /// Install the Rexy Local CA into the OS trust store.
-    Trust,
+    Trust {
+        /// Install into Firefox profiles (NSS) instead of the OS store.
+        #[arg(long)]
+        firefox: bool,
+    },
 
     /// Remove the Rexy Local CA from the OS trust store.
-    Clean,
+    Clean {
+        /// Remove from Firefox profiles (NSS) instead of the OS store.
+        #[arg(long)]
+        firefox: bool,
+    },
+
+    /// Work with redirect rules from a TOML file.
+    Rules {
+        #[command(subcommand)]
+        command: RulesCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RulesCommand {
+    /// Print which rule would match each URL — offline, no proxy or browser.
+    Check {
+        /// TOML file with [[rules]] entries.
+        #[arg(short, long)]
+        file: String,
+
+        /// Emit JSON (one object per URL) instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+
+        /// URLs to check; the scheme is optional (https is assumed).
+        #[arg(required = true)]
+        urls: Vec<String>,
+    },
 }
 
 #[derive(Debug, Parser)]
 struct RunArgs {
-    /// Browser to launch: chrome, chromium, or an executable path.
+    /// Browser to launch: chrome, chromium, firefox, or an executable path.
     #[arg(long, default_value = "chrome")]
     browser: String,
 
     /// TOML file with [[rules]] entries; replaces --host/--path/--target/--csp-override.
     #[arg(short, long)]
     file: Option<String>,
+
+    /// Record intercepted exchanges (request/response) into <dir>/rexy-session.har.
+    #[arg(long, value_name = "DIR")]
+    record: Option<String>,
+
+    /// Answer intercepted requests from a recorded HAR session; unmatched
+    /// requests follow the usual rules.
+    #[arg(long, value_name = "HAR_FILE")]
+    replay: Option<String>,
 
     /// Production hostname to intercept (single-rule mode).
     #[arg(long)]
@@ -68,8 +113,12 @@ struct RunArgs {
     #[arg(long)]
     csp_override: Option<String>,
 
+    /// Do not watch the rules file for changes: rule edits require a restart.
+    #[arg(long)]
+    no_hot_reload: bool,
+
     /// Browser arguments after `--`.
-    #[arg(last = true, trailing_var_arg = true)]
+    #[arg(last = true)]
     browser_args: Vec<String>,
 }
 
@@ -80,23 +129,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Trust) => {
-            trust::install()?;
+        Some(Command::Trust { firefox }) => {
+            if firefox {
+                trust::install_firefox()?;
+            } else {
+                trust::install()?;
+            }
             return Ok(());
         }
 
-        Some(Command::Clean) => {
-            trust::remove()?;
+        Some(Command::Clean { firefox }) => {
+            if firefox {
+                trust::remove_firefox()?;
+            } else {
+                trust::remove()?;
+            }
             return Ok(());
         }
 
-        Some(Command::Run(args)) => run(args).await?,
+        Some(Command::Run(args)) => run(*args).await?,
+
+        Some(Command::Rules { command }) => match command {
+            RulesCommand::Check { file, json, urls } => rules_check(&file, json, &urls)?,
+        },
 
         None => {
             println!("Use:");
             println!();
             println!("  rexy run --file <rules.toml>");
             println!("  rexy run --host <host> --path <path> --target <url> -- <browser args>");
+            println!("  rexy rules check -f <rules.toml> <url>...");
             println!();
             println!("Example:");
             println!();
@@ -125,7 +187,13 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     ca::ensure_exists()?;
 
-    if !trust::is_likely_installed() {
+    let browser = resolve_browser(&args.browser)?;
+
+    if browser.is_firefox() {
+        // Firefox uses its own NSS store: `rexy trust --firefox`, not the OS
+        // store, so the OS-trust gate does not apply here.
+        info!("Firefox browser: make sure the CA is in the profiles (rexy trust --firefox)");
+    } else if !trust::is_likely_installed() {
         eprintln!();
         eprintln!("Rexy Local CA is not installed in the OS trust store.");
         eprintln!("Run:");
@@ -137,8 +205,6 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let browser = resolve_browser(&args.browser)?;
-
     let listener = TcpListener::bind(("127.0.0.1", args.proxy_port)).await?;
     let proxy_addr = listener.local_addr()?;
 
@@ -149,15 +215,106 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let pac_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let pac_addr = pac_listener.local_addr()?;
     let pac_hosts: Vec<String> = rules.iter().map(|rule| rule.host().to_string()).collect();
-    let route_all = std::env::var("REXY_PAC_ALL").map(|v| v == "1").unwrap_or(false);
+    let route_all = std::env::var("REXY_PAC_ALL")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if route_all {
+        tracing::warn!("PAC routes ALL hosts through the proxy (REXY_PAC_ALL=1)");
+    }
     let pac_content = pac::content(&pac_hosts, proxy_addr.port(), route_all);
-    tokio::spawn(pac::serve(pac_listener, pac_content));
+    let shared_pac = std::sync::Arc::new(std::sync::RwLock::new(pac_content));
+    tokio::spawn(pac::serve(pac_listener, std::sync::Arc::clone(&shared_pac)));
 
     let pac_url = format!("http://{pac_addr}/proxy.pac");
 
     let ca = ca::load_ca()?;
 
-    let handler = DevRedirect::new(rules);
+    // Status page: live rule decisions for humans (HTML/SSE) and harness
+    // scripts (JSON). A busy port degrades to a warning, not a failure —
+    // the proxy itself does not depend on it. `REXY_STATUS_PORT=off` turns
+    // the server off entirely.
+    let status_port: Option<u16> = match std::env::var("REXY_STATUS_PORT") {
+        Ok(value) if value.eq_ignore_ascii_case("off") => {
+            info!("status page disabled (REXY_STATUS_PORT=off)");
+            None
+        }
+        Ok(value) => match value.parse() {
+            Ok(port) => Some(port),
+            Err(_) => {
+                tracing::warn!(
+                    value = %value,
+                    "invalid REXY_STATUS_PORT; falling back to the default 8125"
+                );
+                Some(8125)
+            }
+        },
+        Err(_) => Some(8125),
+    };
+
+    let fixtures = resolve_fixtures(&args)?;
+
+    let handler = match fixtures {
+        Fixtures::None => DevRedirect::new(rules),
+        Fixtures::Record(recorder) => {
+            info!(
+                har = %recorder.path().display(),
+                "recording intercepted exchanges"
+            );
+            tracing::warn!(
+                "the recorded HAR contains request and response headers (cookies, \
+                 authorization) and bodies in plaintext — keep the record dir private \
+                 and delete it when the smoke run is done"
+            );
+            DevRedirect::with_fixtures(rules, Some(std::sync::Arc::new(recorder)), None)
+        }
+        Fixtures::Replay(replayer) => {
+            info!(
+                har = %replayer.path().display(),
+                entries = replayer.entry_count(),
+                "replaying from fixtures; unmatched requests follow the rules"
+            );
+            DevRedirect::with_fixtures(rules, None, Some(std::sync::Arc::new(replayer)))
+        }
+    };
+
+    let status_listener = match status_port {
+        Some(port) => match TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => Some(listener),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    port,
+                    "status page port is unavailable; running without it (set REXY_STATUS_PORT)"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
+    if let Some(status_listener) = status_listener {
+        let status_addr = status_listener.local_addr()?;
+        tokio::spawn(status::serve(status_listener, handler.events_handle()));
+        info!("status page: http://{status_addr}/");
+    }
+
+    // Hot reload: watch the rules file so edits apply without restarting the
+    // proxy or the browser (keeping the browser session alive is the point).
+    if let Some(path) = args.file.as_deref() {
+        if args.no_hot_reload {
+            info!("hot reload disabled (--no-hot-reload): rule edits need a restart");
+        } else {
+            // Detached task: lives until the process exits.
+            tokio::spawn(watch_rules_file(
+                std::path::PathBuf::from(path),
+                handler.rules_handle(),
+                std::sync::Arc::clone(&shared_pac),
+                proxy_addr.port(),
+                route_all,
+                std::time::Duration::from_millis(300),
+            ));
+        }
+    }
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -170,10 +327,15 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     .with_native_roots()?
     .with_no_client_auth();
 
+    // HTTP/2 end-to-end: prod pages live on h2 (multiplexing, long-poll),
+    // so the upstream connection negotiates h2 via ALPN whenever the target
+    // supports it. HTTP/3/QUIC stays off — the browser is launched with
+    // --disable-quic.
     let upstream_connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(upstream_tls)
         .https_or_http()
         .enable_http1()
+        .enable_http2()
         .build();
 
     let proxy = Proxy::builder()
@@ -189,6 +351,14 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     info!("proxy listening on http://{proxy_addr}");
 
     for rule in handler.rules() {
+        if !rule.intercept() {
+            info!(
+                "passthrough: https://{}* (intercept = false, CONNECT tunnel only)",
+                rule.host()
+            );
+            continue;
+        }
+
         info!(
             "redirect: https://{}{}* -> {}{}",
             rule.host(),
@@ -208,7 +378,7 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let mut child = browser.spawn(&pac_url, &args.browser_args)?;
+    let (mut child, _temporary_profile) = browser.spawn(&pac_url, &args.browser_args)?;
 
     info!("browser started");
     info!("press Ctrl+C to stop");
@@ -248,6 +418,28 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+enum Fixtures {
+    None,
+    Record(fixtures::Recorder),
+    Replay(fixtures::Replayer),
+}
+
+fn resolve_fixtures(args: &RunArgs) -> Result<Fixtures, Box<dyn std::error::Error>> {
+    match (&args.record, &args.replay) {
+        (Some(_), Some(_)) => Err(
+            "--record and --replay are mutually exclusive: record a session first, then replay it"
+                .into(),
+        ),
+        (Some(dir), None) => Ok(Fixtures::Record(fixtures::Recorder::start(
+            std::path::Path::new(dir),
+        )?)),
+        (None, Some(path)) => Ok(Fixtures::Replay(fixtures::Replayer::open(
+            std::path::Path::new(path),
+        )?)),
+        (None, None) => Ok(Fixtures::None),
+    }
+}
+
 fn resolve_rules(args: &RunArgs) -> Result<Vec<RedirectRule>, Box<dyn std::error::Error>> {
     if let Some(path) = &args.file {
         if args.host.is_some()
@@ -284,7 +476,138 @@ fn resolve_rules(args: &RunArgs) -> Result<Vec<RedirectRule>, Box<dyn std::error
     config::validate_path(&path)?;
     config::validate_target(&target)?;
 
-    Ok(vec![RedirectRule::new(host, path, target, csp_override)])
+    Ok(vec![RedirectRule::new(
+        host,
+        path,
+        target,
+        csp_override,
+        true,
+        false,
+    )])
+}
+
+/// `rexy rules check -f <rules.toml> <url>...`: offline rule evaluation using
+/// the same matcher as the proxy, for config sanity checks from CI and agent
+/// scripts. Unmatched URLs are a normal result (exit code stays 0); an invalid
+/// URL or config file is an error.
+fn rules_check(file: &str, json: bool, urls: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let rules = config::load_rules(std::path::Path::new(file))?;
+
+    let outcomes: Vec<CheckOutcome> = urls
+        .iter()
+        .map(|url| rules::check_url(&rules, url))
+        .collect::<Result<Vec<_>, String>>()?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&outcomes)?);
+    } else {
+        for outcome in &outcomes {
+            print_check_outcome(outcome);
+        }
+    }
+
+    Ok(())
+}
+
+fn print_check_outcome(outcome: &CheckOutcome) {
+    if !outcome.matched {
+        println!("miss  {} -> no matching rule (passthrough)", outcome.url);
+        return;
+    }
+
+    let csp = outcome
+        .csp_override
+        .as_deref()
+        .map(|csp| format!(" (csp: {csp})"))
+        .unwrap_or_default();
+
+    println!(
+        "match {} -> rule #{} (path {}) -> {}{}",
+        outcome.url,
+        outcome
+            .rule_index
+            .expect("matched outcome has a rule index")
+            + 1,
+        outcome.rule_path.as_deref().unwrap_or("/"),
+        outcome.target.as_deref().unwrap_or_default(),
+        csp
+    );
+}
+
+/// Watch the rules file and apply changes without a restart: the rule set is
+/// swapped behind the shared lock, the PAC is regenerated when the host list
+/// changes. A file that fails to load (broken TOML, validation error) keeps
+/// the previous rules — the process never dies from a config edit.
+///
+/// Watching is mtime/size polling (no platform-specific watcher quirks with
+/// editors that save via atomic rename); the poll interval keeps the
+/// apply latency well under a second.
+async fn watch_rules_file(
+    path: std::path::PathBuf,
+    rules: std::sync::Arc<std::sync::RwLock<Vec<rules::RedirectRule>>>,
+    pac_content: std::sync::Arc<std::sync::RwLock<String>>,
+    proxy_port: u16,
+    route_all: bool,
+    interval: std::time::Duration,
+) {
+    let describe = |rules: &[rules::RedirectRule]| -> String {
+        rules
+            .iter()
+            .map(|rule| format!("{}{} -> {}", rule.host(), rule.path(), rule.target()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+
+    let mut signature = file_signature(&path);
+
+    loop {
+        tokio::time::sleep(interval).await;
+
+        let current = file_signature(&path);
+        if current == signature {
+            continue;
+        }
+        signature = current;
+
+        match config::load_rules(&path) {
+            Ok(new_rules) => {
+                let hosts: Vec<String> = new_rules
+                    .iter()
+                    .map(|rule| rule.host().to_string())
+                    .collect();
+
+                // Rules first, PAC second: if the PAC swapped first, a new
+                // host would be tunneled through the proxy during the window
+                // before the rules appear, hitting "host not configured".
+                // Swapping rules first only leaves the host on DIRECT a
+                // moment longer — the status quo before the edit.
+                *rules.write().expect("rules lock is poisoned") = new_rules;
+                *pac_content.write().expect("PAC content lock is poisoned") =
+                    pac::content(&hosts, proxy_port, route_all);
+
+                info!(
+                    "rules file reloaded: {}",
+                    describe(&rules.read().expect("rules lock is poisoned"))
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "failed to reload rules file; keeping the previous rule set"
+                );
+            }
+        }
+    }
+}
+
+/// Cheap change signal for the rules file: editors may save via atomic
+/// rename, so the identity of the file can change — polling mtime+size of the
+/// path catches that as well as in-place writes.
+fn file_signature(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+    std::fs::metadata(path).ok().and_then(|meta| {
+        let modified = meta.modified().ok()?;
+        Some((modified, meta.len()))
+    })
 }
 
 fn init_logging() {
@@ -292,6 +615,9 @@ fn init_logging() {
         .with_env_filter(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "rexy=info,hudsucker=info".into()),
         )
+        // stderr, not stdout: `rules check --json` and other machine-readable
+        // output must stay unpolluted by shadow-warnings and other logs.
+        .with_writer(std::io::stderr)
         .init();
 }
 
@@ -303,11 +629,14 @@ mod tests {
         RunArgs {
             browser: "chrome".into(),
             file: None,
+            record: None,
+            replay: None,
             host: None,
             path: None,
             target: None,
             proxy_port: 0,
             csp_override: None,
+            no_hot_reload: false,
             browser_args: vec![],
         }
     }
@@ -319,6 +648,16 @@ mod tests {
         args.host = Some("a.example.com".into());
 
         assert!(resolve_rules(&args).is_err());
+    }
+
+    #[test]
+    fn run_accepts_browser_arguments_after_separator() {
+        let cli = Cli::try_parse_from(["rexy", "run", "--", "--user-data-dir=/tmp/test", "--flag"])
+            .unwrap();
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected run")
+        };
+        assert_eq!(args.browser_args, ["--user-data-dir=/tmp/test", "--flag"]);
     }
 
     #[test]
@@ -353,6 +692,108 @@ mod tests {
         args.csp_override = Some("bad\nheader".into());
 
         assert!(resolve_rules(&args).is_err());
+    }
+
+    #[tokio::test]
+    async fn hot_reload_applies_changed_rules_and_regenerates_pac() {
+        let path =
+            std::env::temp_dir().join(format!("rexy-hot-reload-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "[[rules]]\nhost = \"a.example.com\"\ntarget = \"http://127.0.0.1:1111\"\n",
+        )
+        .unwrap();
+
+        let rules = resolve_rules(&file_mode_args(&path)).unwrap();
+        let handler = DevRedirect::new(rules);
+        let rules_handle = handler.rules_handle();
+
+        let pac = std::sync::Arc::new(std::sync::RwLock::new(String::new()));
+        let pac_handle = std::sync::Arc::clone(&pac);
+
+        let watcher = tokio::spawn(watch_rules_file(
+            path.clone(),
+            rules_handle.clone(),
+            pac_handle,
+            8888,
+            false,
+            std::time::Duration::from_millis(20),
+        ));
+
+        // Let the watcher pick up the initial signature first.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        std::fs::write(
+            &path,
+            "[[rules]]\nhost = \"a.example.com\"\ntarget = \"http://127.0.0.1:1111\"\n\n[[rules]]\nhost = \"b.example.com\"\ntarget = \"http://127.0.0.1:2222\"\n",
+        )
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let current = rules_handle.read().unwrap();
+        assert_eq!(current.len(), 2);
+        assert_eq!(current[1].host(), "b.example.com");
+        drop(current);
+
+        // PAC was regenerated with the new host list.
+        let pac_now = pac.read().unwrap().clone();
+        assert!(pac_now.contains("b.example.com"), "{pac_now}");
+        assert!(pac_now.contains("PROXY 127.0.0.1:8888"));
+
+        watcher.abort();
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn hot_reload_keeps_old_rules_on_broken_config() {
+        let path =
+            std::env::temp_dir().join(format!("rexy-hot-broken-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "[[rules]]\nhost = \"a.example.com\"\ntarget = \"http://127.0.0.1:1111\"\n",
+        )
+        .unwrap();
+
+        let rules = resolve_rules(&file_mode_args(&path)).unwrap();
+        let handler = DevRedirect::new(rules);
+        let rules_handle = handler.rules_handle();
+
+        let watcher = tokio::spawn(watch_rules_file(
+            path.clone(),
+            rules_handle.clone(),
+            std::sync::Arc::new(std::sync::RwLock::new(String::new())),
+            8888,
+            false,
+            std::time::Duration::from_millis(20),
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        // Broken TOML: the previous rule set must survive.
+        std::fs::write(&path, "[[rules]]\nhost = ").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(rules_handle.read().unwrap().len(), 1);
+
+        // A later valid edit still applies (the watcher did not die).
+        std::fs::write(
+            &path,
+            "[[rules]]\nhost = \"c.example.com\"\ntarget = \"http://127.0.0.1:3333\"\n",
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let current = rules_handle.read().unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].host(), "c.example.com");
+
+        watcher.abort();
+        std::fs::remove_file(&path).ok();
+    }
+
+    fn file_mode_args(path: &std::path::Path) -> RunArgs {
+        let mut args = base_args();
+        args.file = Some(path.to_string_lossy().into_owned());
+        args
     }
 
     #[test]

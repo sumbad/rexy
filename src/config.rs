@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::proxy_handler::{CspOverride, RedirectRule};
+use crate::rules::{CspOverride, RedirectRule};
 
 #[derive(Debug, Deserialize)]
 struct ConfigFile {
@@ -18,6 +18,18 @@ struct FileRule {
     target: String,
     #[serde(default)]
     csp_override: Option<String>,
+    /// CONNECT-tunnel this host without decryption (escape hatch for pinned
+    /// clients and MITM-unfriendly WAFs). Default: intercept.
+    #[serde(default = "default_true")]
+    intercept: bool,
+    /// Shed embedding blockers (X-Frame-Options, COOP/COEP/CORP) on responses
+    /// from this rule's target — for iframe scenarios.
+    #[serde(default)]
+    embed: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_path() -> String {
@@ -36,26 +48,199 @@ pub fn load_rules(path: &Path) -> Result<Vec<RedirectRule>, Box<dyn std::error::
     let parsed: ConfigFile = toml::from_str(&raw)
         .map_err(|err| format!("failed to parse config file {}: {err}", path.display()))?;
 
-    parsed.rules.into_iter().map(rule_from_file).collect()
+    let rules: Vec<RedirectRule> = parsed
+        .rules
+        .into_iter()
+        .enumerate()
+        .map(|(index, rule)| rule_from_file(rule, index))
+        .collect::<Result<_, _>>()?;
+
+    warn_shadowed_rules(&rules);
+
+    Ok(rules)
 }
 
-fn rule_from_file(rule: FileRule) -> Result<RedirectRule, Box<dyn std::error::Error>> {
-    validate_host(&rule.host)?;
-    validate_path(&rule.path)?;
-    validate_target(&rule.target)?;
+/// Pairs of rule indices where the earlier rule (first-match-wins) shadows a
+/// later one: same host, and the earlier path prefix covers the later rule's
+/// path — including equal paths (a duplicate host+path). Hosts and paths come
+/// from `RedirectRule` accessors, already normalized exactly like the matcher
+/// normalizes them.
+fn shadowed_pairs(rules: &[RedirectRule]) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
 
+    for (later_idx, later) in rules.iter().enumerate() {
+        for (earlier_idx, earlier) in rules.iter().enumerate().take(later_idx) {
+            // A passthrough rule (intercept = false) never rewrites traffic,
+            // so it cannot shadow anything: a later interceptable rule for
+            // the same paths still fires.
+            if !earlier.intercept() {
+                continue;
+            }
+            if earlier.host() == later.host() && later.path().starts_with(earlier.path()) {
+                pairs.push((earlier_idx, later_idx));
+            }
+        }
+    }
+
+    pairs
+}
+
+fn warn_shadowed_rules(rules: &[RedirectRule]) {
+    for (earlier, later) in shadowed_pairs(rules) {
+        tracing::warn!(
+            earlier = format!(
+                "#{} {}{}",
+                earlier + 1,
+                rules[earlier].host(),
+                rules[earlier].path()
+            ),
+            later = format!(
+                "#{} {}{}",
+                later + 1,
+                rules[later].host(),
+                rules[later].path()
+            ),
+            "rule is shadowed: the earlier rule matches first (first-match-wins), \
+             so the later rule never fires for these paths — \
+             reorder rules so the more specific path comes first"
+        );
+    }
+}
+
+fn rule_from_file(
+    rule: FileRule,
+    index: usize,
+) -> Result<RedirectRule, Box<dyn std::error::Error>> {
+    let host = interpolate_field(&rule.host, index, "host")?;
+    let path = interpolate_field(&rule.path, index, "path")?;
+    let target = interpolate_field(&rule.target, index, "target")?;
     let csp_override = rule
         .csp_override
         .as_deref()
-        .map(parse_csp_value)
+        .map(|raw| interpolate_field(raw, index, "csp_override"))
+        .transpose()?;
+
+    wrap_validation(validate_host(&host), "host", index)?;
+    wrap_validation(validate_path(&path), "path", index)?;
+    wrap_validation(validate_target(&target), "target", index)?;
+
+    let csp_override = csp_override
+        .map(|value| parse_csp_value(&value))
         .transpose()?;
 
     Ok(RedirectRule::new(
-        rule.host,
-        rule.path,
-        rule.target,
+        host,
+        path,
+        target,
         csp_override,
+        rule.intercept,
+        rule.embed,
     ))
+}
+
+/// Validation errors are useless without the rule and the field they belong
+/// to: a rules file with many entries must say which line to fix.
+fn wrap_validation(
+    result: Result<(), Box<dyn std::error::Error>>,
+    field: &str,
+    rule_index: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    result.map_err(|err| format!("rule #{} (field {field}): {err}", rule_index + 1).into())
+}
+
+/// Expand environment variable references in a rule field, after TOML parsing
+/// (so an expanded value can never break the file's structure).
+///
+/// Supported syntax (bracketed form only, like Docker Compose):
+/// - `${VAR}` — the variable's value; an unset variable without a default is
+///   a load error naming the variable and the rule;
+/// - `${VAR:-default}` — the variable's value, or `default` when unset or
+///   empty-free (an empty value is a value, not an error);
+/// - `$$` — a literal `$`, so `$${VAR}` stays a literal `${VAR}`;
+/// - a bare `$VAR` (no braces) is NOT interpolated — `$` outside `${` is a
+///   literal dollar sign.
+fn interpolate_field(input: &str, rule_index: usize, field: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            out.push(ch);
+            continue;
+        }
+
+        match chars.peek() {
+            Some('$') => {
+                chars.next();
+                out.push('$');
+            }
+            Some('{') => {
+                chars.next();
+
+                let mut expr = String::new();
+                loop {
+                    match chars.next() {
+                        None => {
+                            return Err(format!(
+                                "unterminated ${{…}} — missing '}}' after '${{{expr}"
+                            ));
+                        }
+                        Some('}') => break,
+                        Some(c) => expr.push(c),
+                    }
+                }
+
+                out.push_str(&expand_expr(&expr, rule_index, field)?);
+            }
+            _ => out.push('$'),
+        }
+    }
+
+    Ok(out)
+}
+
+/// Expand one `${…}` expression body: `VAR` or `VAR:-default`.
+fn expand_expr(expr: &str, rule_index: usize, field: &str) -> Result<String, String> {
+    let (name, default) = match expr.split_once(":-") {
+        Some((name, default)) => (name, Some(default)),
+        None => (expr, None),
+    };
+
+    let invalid_name = || {
+        format!(
+            "invalid variable name {:?} in ${{{expr}}} — \
+             expected letters, digits or '_' and a non-empty name",
+            name
+        )
+    };
+
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(invalid_name());
+    }
+
+    match std::env::var(name) {
+        Ok(value) => {
+            if value.is_empty() {
+                // `${VAR:-default}` also covers an empty value (bash `:-`
+                // semantics); an empty value with no default stays empty.
+                match default {
+                    Some(default) => Ok(default.to_string()),
+                    None => Ok(value),
+                }
+            } else {
+                Ok(value)
+            }
+        }
+        Err(std::env::VarError::NotPresent) => match default {
+            Some(default) => Ok(default.to_string()),
+            None => Err(format!(
+                "environment variable {name} is not set (referenced by field {field:?} \
+                 of rule #{}, as ${{{expr}}})",
+                rule_index + 1
+            )),
+        },
+        Err(err @ std::env::VarError::NotUnicode(_)) => Err(err.to_string()),
+    }
 }
 
 /// Parse the CSP override value shared by the CLI flag and config entries:
@@ -95,6 +280,23 @@ pub fn validate_host(host: &str) -> Result<(), Box<dyn std::error::Error>> {
         return Err("host must not contain a path".into());
     }
 
+    // WHY: the host is embedded into generated PAC JavaScript (pac.rs builds
+    // `host === "<host>"` conditions) — quotes, backslashes or braces there
+    // would allow injecting arbitrary code into FindProxyForURL. Domain
+    // names (including punycode `xn--` labels and the underscore labels
+    // common in internal DNS) are fully covered by this whitelist, and an
+    // underscore is inert inside the double-quoted JS string.
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        return Err(
+            "host may only contain ASCII letters, digits, dots, dashes and underscores \
+             (IPv6 literals are not supported)"
+                .into(),
+        );
+    }
+
     Ok(())
 }
 
@@ -107,6 +309,21 @@ pub fn validate_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn validate_target(target: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Map Local: serve static files from a directory instead of a dev server.
+    if let Some(dir) = target.strip_prefix("file:") {
+        // RedirectRule::new trims trailing slashes off the target, so
+        // "file:/" degrades to "file:" — an eternal 404 with no hint about
+        // the misconfiguration. Check emptiness after the same
+        // normalization the rule applies.
+        if dir.trim().trim_end_matches('/').is_empty() {
+            return Err(
+                "file: target must contain a directory path, e.g. file:/path/to/assets".into(),
+            );
+        }
+
+        return Ok(());
+    }
+
     let parsed: hudsucker::hyper::Uri = target.parse()?;
 
     match parsed.scheme_str() {
@@ -128,10 +345,13 @@ mod tests {
     use super::*;
 
     fn write_temp_config(content: &str) -> std::path::PathBuf {
+        // A counter, not the content length: two configs of the same length
+        // written in one test run must not collide on the temp path.
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
             "rexy-config-test-{}-{}.toml",
             std::process::id(),
-            content.len()
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::write(&path, content).unwrap();
         path
@@ -190,6 +410,98 @@ csp_override = "frame-ancestors *"
     }
 
     #[test]
+    fn intercept_defaults_to_true_and_parses_false() {
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "normal.example.com"
+target = "http://127.0.0.1:1111"
+
+[[rules]]
+host = "pinned.example.com"
+target = "http://127.0.0.1:1111"
+intercept = false
+"#,
+        );
+
+        let rules = load_rules(&path).unwrap();
+
+        assert!(rules[0].intercept());
+        assert!(!rules[1].intercept());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn embed_defaults_to_false_and_parses_true() {
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "plain.example.com"
+target = "http://127.0.0.1:1111"
+
+[[rules]]
+host = "framed.example.com"
+target = "http://127.0.0.1:2222"
+embed = true
+"#,
+        );
+
+        let rules = load_rules(&path).unwrap();
+
+        assert!(!rules[0].embed());
+        assert!(rules[1].embed());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn file_target_is_valid_and_requires_a_path() {
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "assets.example.com"
+target = "file:/tmp/rexy-assets"
+"#,
+        );
+
+        let rules = load_rules(&path).unwrap();
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].target(), "file:/tmp/rexy-assets");
+
+        std::fs::remove_file(&path).ok();
+
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "assets.example.com"
+target = "file:"
+"#,
+        );
+
+        assert!(load_rules(&path).is_err());
+
+        std::fs::remove_file(&path).ok();
+
+        // "file:/" is a valid target syntactically, but RedirectRule::new
+        // trims the trailing slash, leaving an empty directory — the rule
+        // would 404 forever with no hint. It must fail at load time.
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "assets.example.com"
+target = "file:/"
+"#,
+        );
+
+        let err = load_rules(&path).unwrap_err().to_string();
+        assert!(err.contains("rule #1 (field target)"), "{err}");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn empty_rules_list_is_ok() {
         let path = write_temp_config("rules = []\n");
         assert_eq!(load_rules(&path).unwrap().len(), 0);
@@ -229,6 +541,52 @@ target = "http://127.0.0.1:1111"
     }
 
     #[test]
+    fn host_whitelist_rejects_pac_injection_characters() {
+        // The host is embedded into PAC JavaScript: quotes, backslashes and
+        // braces must not survive validation.
+        for bad in [
+            "a.example.com\"; alert(1); \"",
+            "a.example.com\\",
+            "a.example.com${x}",
+            "a example.com",
+            "a@example.com",
+            "a.example.com:443",
+            "a.example.com'",
+        ] {
+            assert!(validate_host(bad).is_err(), "{bad} must be rejected");
+        }
+
+        // Real-world hostnames pass: subdomains, punycode, dashes and the
+        // underscore labels common in internal DNS (inert in the JS string).
+        for good in [
+            "a.example.com",
+            "xn--80ak6aa92e.example",
+            "my-team.internal",
+            "my_host.internal",
+        ] {
+            assert!(validate_host(good).is_ok(), "{good} must be accepted");
+        }
+    }
+
+    #[test]
+    fn underscore_host_loads_and_matches() {
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "my_host.internal"
+target = "http://127.0.0.1:1111"
+"#,
+        );
+
+        let rules = load_rules(&path).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].host(), "my_host.internal");
+        assert!(rules[0].matches("my_host.internal", "/"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn rejects_invalid_target() {
         let path = write_temp_config(
             r#"
@@ -239,6 +597,37 @@ target = "ftp://127.0.0.1:1111"
         );
 
         assert!(load_rules(&path).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn validation_errors_name_the_rule_and_field() {
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "a.example.com"
+target = "ftp://127.0.0.1:1111"
+"#,
+        );
+
+        let err = load_rules(&path).unwrap_err().to_string();
+        assert!(err.contains("rule #1"), "{err}");
+        assert!(err.contains("field target"), "{err}");
+        assert!(err.contains("http:// or https://"), "{err}");
+
+        std::fs::remove_file(&path).ok();
+
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "https://a.example.com"
+target = "http://127.0.0.1:1111"
+"#,
+        );
+
+        let err = load_rules(&path).unwrap_err().to_string();
+        assert!(err.contains("rule #1 (field host)"), "{err}");
+
         std::fs::remove_file(&path).ok();
     }
 
@@ -266,5 +655,264 @@ csp_override = "frame-ancestors *\nX-Evil: y"
         );
         assert!(parse_csp_value("   ").is_err());
         assert!(parse_csp_value("x\ny").is_err());
+    }
+
+    fn rule(host: &str, path: &str) -> RedirectRule {
+        RedirectRule::new(
+            host.into(),
+            path.into(),
+            "http://127.0.0.1:1111".into(),
+            None,
+            true,
+            false,
+        )
+    }
+
+    fn passthrough_rule(host: &str, path: &str) -> RedirectRule {
+        RedirectRule::new(
+            host.into(),
+            path.into(),
+            "http://127.0.0.1:1111".into(),
+            None,
+            false,
+            false,
+        )
+    }
+
+    #[test]
+    fn passthrough_rule_does_not_shadow_later_rules() {
+        // The passthrough rule never rewrites anything, so a later
+        // interceptable rule for the same paths still fires — no warning.
+        let rules = vec![
+            passthrough_rule("app.example.com", "/"),
+            rule("app.example.com", "/api/"),
+        ];
+
+        assert!(shadowed_pairs(&rules).is_empty());
+    }
+
+    #[test]
+    fn shadowing_is_detected_for_specific_rule_after_generic() {
+        let rules = vec![
+            rule("app.example.com", "/api/"),
+            rule("app.example.com", "/api/v1/omicron/get"),
+        ];
+
+        assert_eq!(shadowed_pairs(&rules), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn shadowing_is_detected_for_duplicate_rules() {
+        let rules = vec![
+            rule("app.example.com", "/api/"),
+            rule("app.example.com", "/api/"),
+        ];
+
+        assert_eq!(shadowed_pairs(&rules), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn specific_rule_first_is_not_shadowing() {
+        let rules = vec![
+            rule("app.example.com", "/api/v1/omicron/get"),
+            rule("app.example.com", "/api/"),
+        ];
+
+        assert!(shadowed_pairs(&rules).is_empty());
+    }
+
+    #[test]
+    fn different_or_uncomparable_hosts_are_silent() {
+        let rules = vec![
+            rule("app.example.com", "/"),
+            rule("other.example.com", "/"),
+            rule("app.example.com", "/api/"),
+        ];
+
+        // app /  shadows app /api/ ; other /  is a different host — no pair.
+        assert_eq!(shadowed_pairs(&rules), vec![(0, 2)]);
+    }
+
+    #[test]
+    fn prefix_paths_of_same_host_are_comparable() {
+        // "/app" prefix covers "/apple" too — the later rule is unreachable.
+        let rules = vec![
+            rule("app.example.com", "/app"),
+            rule("app.example.com", "/apple"),
+        ];
+
+        assert_eq!(shadowed_pairs(&rules), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn shorter_but_not_prefix_path_is_silent() {
+        // "/api/" does not cover "/api" (no trailing slash in the later rule).
+        let rules = vec![
+            rule("app.example.com", "/api/"),
+            rule("app.example.com", "/api"),
+        ];
+
+        assert!(shadowed_pairs(&rules).is_empty());
+    }
+
+    #[test]
+    fn load_rules_logs_without_failing_on_shadowing() {
+        // Shadowing is a warning, not an error: the config still loads.
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "app.example.com"
+path = "/api/"
+target = "http://127.0.0.1:1111"
+
+[[rules]]
+host = "app.example.com"
+path = "/api/v1/omicron/get"
+target = "http://127.0.0.1:8124"
+"#,
+        );
+
+        let rules = load_rules(&path).unwrap();
+
+        assert_eq!(rules.len(), 2);
+        assert_eq!(shadowed_pairs(&rules), vec![(0, 1)]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // Environment mutation is process-global: every env-dependent scenario
+    // runs inside ONE test so parallel tests cannot race on the variables.
+    #[test]
+    fn interpolation_with_environment() {
+        unsafe {
+            std::env::set_var("REXY_TEST_HOST", "prod.example.com");
+            std::env::set_var("REXY_TEST_PORT", "8123");
+            std::env::set_var("REXY_TEST_EMPTY", "");
+        }
+        let set = |name: &str| unsafe { std::env::remove_var(name) };
+
+        // Present variable expands.
+        assert_eq!(
+            interpolate_field("${REXY_TEST_HOST}/api/", 0, "path").unwrap(),
+            "prod.example.com/api/"
+        );
+
+        // Default used when unset...
+        set("REXY_TEST_UNSET");
+        assert_eq!(
+            interpolate_field("${REXY_TEST_UNSET:-8124}", 0, "path").unwrap(),
+            "8124"
+        );
+        // ...and when set-but-empty (bash `:-` semantics)...
+        assert_eq!(
+            interpolate_field("127.0.0.1:${REXY_TEST_EMPTY:-8124}", 0, "target").unwrap(),
+            "127.0.0.1:8124"
+        );
+        // ...while a present value wins over the default.
+        assert_eq!(
+            interpolate_field("127.0.0.1:${REXY_TEST_PORT:-9999}", 0, "target").unwrap(),
+            "127.0.0.1:8123"
+        );
+
+        // Empty value with no default expands to empty, without an error.
+        assert_eq!(
+            interpolate_field("x${REXY_TEST_EMPTY}y", 0, "path").unwrap(),
+            "xy"
+        );
+
+        // Unset without default — error naming the variable, rule and field.
+        let err = interpolate_field("${REXY_TEST_UNSET}", 2, "target").unwrap_err();
+        assert!(err.contains("REXY_TEST_UNSET"), "{err}");
+        assert!(err.contains("#3"), "{err}");
+        assert!(err.contains("target"), "{err}");
+
+        // Bare $VAR is NOT interpolated; $ outside ${...} is literal.
+        assert_eq!(
+            interpolate_field("$REXY_TEST_HOST", 0, "path").unwrap(),
+            "$REXY_TEST_HOST"
+        );
+        assert_eq!(
+            interpolate_field("price $5", 0, "path").unwrap(),
+            "price $5"
+        );
+        assert_eq!(
+            interpolate_field("trailing $", 0, "path").unwrap(),
+            "trailing $"
+        );
+
+        // `$$` escapes a literal `$`; `$${VAR}` stays literal `${VAR}`.
+        assert_eq!(interpolate_field("$$8123", 0, "path").unwrap(), "$8123");
+        assert_eq!(
+            interpolate_field("$${REXY_TEST_HOST}", 0, "path").unwrap(),
+            "${REXY_TEST_HOST}"
+        );
+
+        // Malformed references are errors.
+        assert!(interpolate_field("${REXY_TEST_HOST", 0, "path").is_err()); // unterminated
+        assert!(interpolate_field("${}", 0, "path").is_err()); // empty name
+        assert!(interpolate_field("${1BAD}", 0, "path").is_err()); // bad name chars
+    }
+
+    #[test]
+    fn interpolation_neutral_without_dollar() {
+        // Configs without `${…}` parse exactly as before.
+        assert_eq!(
+            interpolate_field("app.example.com", 0, "host").unwrap(),
+            "app.example.com"
+        );
+        assert_eq!(
+            interpolate_field("/api/v1/", 3, "path").unwrap(),
+            "/api/v1/"
+        );
+        assert_eq!(interpolate_field("", 0, "csp_override").unwrap(), "");
+    }
+
+    #[test]
+    fn load_rules_expands_environment_in_fields() {
+        unsafe {
+            std::env::set_var("REXY_TEST_RULES_HOST", "a.example.com");
+            std::env::set_var("REXY_TEST_RULES_CSP", "frame-ancestors *");
+        }
+
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "${REXY_TEST_RULES_HOST}"
+target = "http://127.0.0.1:${REXY_TEST_RULES_PORT:-1111}"
+csp_override = "${REXY_TEST_RULES_CSP}"
+"#,
+        );
+
+        let rules = load_rules(&path).unwrap();
+
+        assert_eq!(rules[0].host(), "a.example.com");
+        assert_eq!(rules[0].target(), "http://127.0.0.1:1111");
+        assert_eq!(
+            rules[0].csp_override(),
+            Some(&CspOverride::Policy("frame-ancestors *".into()))
+        );
+
+        unsafe {
+            std::env::remove_var("REXY_TEST_RULES_HOST");
+            std::env::remove_var("REXY_TEST_RULES_CSP");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn load_rules_fails_when_variable_is_unset() {
+        let path = write_temp_config(
+            r#"
+[[rules]]
+host = "${REXY_TEST_DEFINITELY_UNSET_VAR}"
+target = "http://127.0.0.1:1111"
+"#,
+        );
+
+        let err = load_rules(&path).unwrap_err().to_string();
+        assert!(err.contains("REXY_TEST_DEFINITELY_UNSET_VAR"), "{err}");
+        assert!(err.contains("#1"), "{err}");
+
+        std::fs::remove_file(&path).ok();
     }
 }

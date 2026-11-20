@@ -1,17 +1,12 @@
+use std::sync::Arc;
+
+use crate::fixtures::{HarHeader, Recorder, Replayer};
+use crate::rules::{CspOverride, RedirectRule, local_target_host};
+use crate::status::{Decision, EventLog, now_ms};
 use hudsucker::{
     Body, HttpContext, HttpHandler, RequestOrResponse,
-    hyper::{HeaderMap, Request, Response, Uri, header},
+    hyper::{HeaderMap, Request, Response, body::Bytes, header},
 };
-
-/// How to rewrite the `Content-Security-Policy` header of responses served
-/// from the local target. Parsed from `rexy run --csp-override`.
-#[derive(Clone, Debug, PartialEq)]
-pub enum CspOverride {
-    /// Remove all Content-Security-Policy headers.
-    Off,
-    /// Replace all Content-Security-Policy headers with this policy string.
-    Policy(String),
-}
 
 /// Replace or remove every `Content-Security-Policy` header.
 ///
@@ -34,117 +29,293 @@ fn apply_csp_override(headers: &mut HeaderMap, csp: &CspOverride) {
     }
 }
 
-/// One redirect rule: which host/path prefix to intercept and which local
-/// target to serve it from.
-#[derive(Clone, Debug)]
-pub struct RedirectRule {
-    prod_host: String,
-    path_prefix: String,
-    local_target: String,
-    csp_override: Option<CspOverride>,
+/// The original prod URL of a request, as seen before any rewrite: absolute
+/// URIs (plain-HTTP proxy requests) keep their scheme; requests on decrypted
+/// TLS connections without a scheme in the URI are composed as `https://`.
+/// Both recording and replaying use this, so the keys always match.
+fn original_url(req: &Request<Body>) -> String {
+    let uri = req.uri();
+
+    if uri.scheme_str().is_some() && uri.host().is_some() {
+        return uri.to_string();
+    }
+
+    let host = DevRedirect::request_host(req).unwrap_or_default();
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+
+    format!("https://{host}{path_and_query}")
 }
 
-impl RedirectRule {
-    pub fn new(
-        prod_host: String,
-        path_prefix: String,
-        local_target: String,
-        csp_override: Option<CspOverride>,
-    ) -> Self {
+fn headers_to_har(headers: &HeaderMap) -> Vec<HarHeader> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let value = value.to_str().ok()?;
+            Some(HarHeader {
+                name: name.as_str().to_string(),
+                value: value.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Remove the headers that stop a page from being embedded in an iframe of a
+/// parent shell. Used when the matched rule sets `embed = true`; only
+/// responses served from that rule's target are affected — passthrough
+/// traffic keeps its headers. CSP handling is separate (`csp_override`), so
+/// the typical iframe scenario is `embed = true` plus `csp_override = "off"`.
+fn strip_embed_blockers(headers: &mut HeaderMap) {
+    // hyper's `header` module has no constants for the cross-origin policies.
+    let blockers = [
+        header::X_FRAME_OPTIONS,
+        header::HeaderName::from_static("cross-origin-opener-policy"),
+        header::HeaderName::from_static("cross-origin-embedder-policy"),
+        header::HeaderName::from_static("cross-origin-resource-policy"),
+    ];
+
+    for name in blockers {
+        if headers.remove(&name).is_some() {
+            tracing::debug!(%name, "removed embed blocker from target response");
+        }
+    }
+}
+
+/// Remove the headers that describe a body when the actual body could not be
+/// delivered: on a buffering failure the client gets an empty body, and stale
+/// `Content-Length`/`Content-Encoding`/`Transfer-Encoding` would make it wait
+/// for (or misdecode) bytes that never arrive.
+fn strip_stale_body_headers(headers: &mut HeaderMap) {
+    for name in [
+        header::CONTENT_LENGTH,
+        header::CONTENT_ENCODING,
+        header::TRANSFER_ENCODING,
+    ] {
+        headers.remove(name);
+    }
+}
+
+/// What to do to the response of the current request: CSP override from the
+/// matched rule plus whether the rule asked to shed embedding blockers.
+#[derive(Clone, Debug, Default)]
+struct ResponseEdits {
+    csp_override: Option<CspOverride>,
+    embed: bool,
+}
+
+impl ResponseEdits {
+    fn from_rule(rule: &RedirectRule) -> Self {
         Self {
-            prod_host: prod_host.trim_end_matches('.').to_ascii_lowercase(),
-            path_prefix: normalize_path_prefix(&path_prefix),
-            local_target: local_target.trim_end_matches('/').to_string(),
-            csp_override,
+            csp_override: rule.csp_override().cloned(),
+            embed: rule.embed(),
         }
     }
+}
 
-    pub fn host(&self) -> &str {
-        &self.prod_host
-    }
+/// Per-request correlation: the status event id, start time and response
+/// edits of the most recent matched request, consumed by `handle_response`
+/// of the same request.
+///
+/// hudsucker clones the handler per request, so this must NOT be an
+/// accumulating structure: a queue would leak entries from the CONNECT
+/// phase into every clone (clones are made from the instance that already
+/// processed CONNECT). Overwriting the field in `handle_request` makes
+/// inherited values irrelevant.
+#[derive(Clone, Debug)]
+struct Pending {
+    event_id: u64,
+    started_ms: u64,
+    edits: ResponseEdits,
+}
 
-    pub fn path(&self) -> &str {
-        &self.path_prefix
-    }
-
-    pub fn target(&self) -> &str {
-        &self.local_target
-    }
-
-    pub fn csp_override(&self) -> Option<&CspOverride> {
-        self.csp_override.as_ref()
-    }
-
-    fn matches_host(&self, host: &str) -> bool {
-        normalize_host(host) == self.prod_host
-    }
-
-    fn matches_request(&self, req: &Request<Body>) -> bool {
-        // HTTP/2 requests carry the authority in the URI (`:authority`), not a
-        // `host` header — fall back to the URI host so those requests still match.
-        let host = req
-            .headers()
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .map(normalize_host)
-            .or_else(|| req.uri().host().map(normalize_host));
-
-        let Some(host) = host else {
-            return false;
-        };
-
-        if host != self.prod_host {
-            return false;
-        }
-
-        req.uri().path().starts_with(&self.path_prefix)
-    }
-
-    fn target_uri(&self, req: &Request<Body>) -> Option<Uri> {
-        let path_and_query = req
-            .uri()
-            .path_and_query()
-            .map(|value| value.as_str())
-            .unwrap_or("/");
-
-        format!("{}{}", self.local_target, path_and_query)
-            .parse::<Uri>()
-            .ok()
-    }
+/// Per-request metadata for the recording phase: the request method, the
+/// original prod URL and request headers, captured before any rewrite.
+#[derive(Clone, Debug)]
+struct RecordMeta {
+    method: String,
+    url: String,
+    headers: Vec<HarHeader>,
+    started_ms: u128,
 }
 
 #[derive(Clone, Debug)]
 pub struct DevRedirect {
-    rules: Vec<RedirectRule>,
-    /// CSP override of the most recent matched request, consumed by
-    /// `handle_response` of the same request.
-    ///
-    /// hudsucker clones the handler per request, so this must NOT be an
-    /// accumulating structure: a queue would leak entries from the CONNECT
-    /// phase into every clone (clones are made from the instance that already
-    /// processed CONNECT). Overwriting the field in `handle_request` makes
-    /// inherited values irrelevant.
-    pending_csp: Option<CspOverride>,
+    /// Current rule set, shared with the hot-reload watcher: the watcher
+    /// swaps the contents while running handler clones keep reading.
+    rules: std::sync::Arc<std::sync::RwLock<Vec<RedirectRule>>>,
+    /// Shared status event log: the status page server reads what we record.
+    events: Arc<EventLog>,
+    /// `--record <dir>`: write intercepted exchanges into a HAR file.
+    recorder: Option<Arc<Recorder>>,
+    /// `--replay <file>`: answer requests from a recorded session before the
+    /// rules get a chance.
+    replayer: Option<Arc<Replayer>>,
+    pending: Option<Pending>,
+    pending_record: Option<RecordMeta>,
 }
 
 impl DevRedirect {
     pub fn new(rules: Vec<RedirectRule>) -> Self {
+        Self::with_events(rules, EventLog::new())
+    }
+
+    pub fn with_events(rules: Vec<RedirectRule>, events: Arc<EventLog>) -> Self {
         Self {
-            rules,
-            pending_csp: None,
+            rules: std::sync::Arc::new(std::sync::RwLock::new(rules)),
+            events,
+            recorder: None,
+            replayer: None,
+            pending: None,
+            pending_record: None,
         }
     }
 
-    pub fn rules(&self) -> &[RedirectRule] {
-        &self.rules
+    pub fn with_fixtures(
+        rules: Vec<RedirectRule>,
+        recorder: Option<Arc<Recorder>>,
+        replayer: Option<Arc<Replayer>>,
+    ) -> Self {
+        Self {
+            rules: std::sync::Arc::new(std::sync::RwLock::new(rules)),
+            events: EventLog::new(),
+            recorder,
+            replayer,
+            pending: None,
+            pending_record: None,
+        }
     }
 
-    fn matching_rule(&self, req: &Request<Body>) -> Option<&RedirectRule> {
-        self.rules.iter().find(|rule| rule.matches_request(req))
+    pub fn rules_handle(&self) -> std::sync::Arc<std::sync::RwLock<Vec<RedirectRule>>> {
+        std::sync::Arc::clone(&self.rules)
     }
 
+    /// The shared event log handle for the status page server.
+    pub fn events_handle(&self) -> Arc<EventLog> {
+        Arc::clone(&self.events)
+    }
+
+    /// Replay from fixtures has priority over the rules: an offline smoke
+    /// must not touch the network. The original prod URL is the key.
+    fn replay_response(&self, req: &Request<Body>) -> Option<Response<Body>> {
+        use base64::Engine;
+
+        let replayer = self.replayer.as_ref()?;
+        let url = original_url(req);
+
+        let recorded = replayer.lookup(req.method().as_str(), &url)?;
+
+        let mut builder = Response::builder().status(recorded.status);
+        for header in &recorded.headers {
+            if let (Ok(name), Ok(value)) = (
+                header.name.parse::<header::HeaderName>(),
+                header::HeaderValue::from_str(&header.value),
+            ) {
+                builder = builder.header(name, value);
+            }
+        }
+
+        let text = recorded.content.text.as_deref().unwrap_or_default();
+        let body = if recorded.content.encoding.as_deref() == Some("base64") {
+            base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .unwrap_or_default()
+        } else {
+            text.as_bytes().to_vec()
+        };
+
+        // The URL (query included) may carry session tokens — the info line
+        // stays query-free, the full URL is debug-level.
+        tracing::info!(
+            host = %DevRedirect::request_host(req).unwrap_or_default(),
+            path = %req.uri().path(),
+            status = recorded.status,
+            "replaying response from fixtures"
+        );
+        tracing::debug!(%url, "replayed fixture URL");
+
+        Some(
+            builder
+                .body(Body::from(body))
+                .expect("fixture response with valid status builds"),
+        )
+    }
+
+    fn record_meta(req: &Request<Body>) -> Option<RecordMeta> {
+        Some(RecordMeta {
+            method: req.method().to_string(),
+            url: original_url(req),
+            headers: headers_to_har(req.headers()),
+            started_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+        })
+    }
+
+    /// Host of an intercepted request: the `host` header, falling back to the
+    /// URI host — HTTP/2 requests carry the authority in `:authority`, not a
+    /// `host` header, so without the fallback they would never match.
+    fn request_host(req: &Request<Body>) -> Option<String> {
+        req.headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| req.uri().host().map(str::to_string))
+    }
+
+    /// Snapshot of the current rules for startup logging.
+    pub fn rules(&self) -> Vec<RedirectRule> {
+        self.rules.read().expect("rules lock is poisoned").clone()
+    }
+
+    /// Index (first-match-wins) and a snapshot of the rule matching the
+    /// request. `intercept = false` rules never rewrite traffic: their host
+    /// is tunneled untouched, so a matching request must not be redirected
+    /// (plain-HTTP requests reach the handler without a TLS layer).
+    fn matching_rule_index(&self, req: &Request<Body>) -> Option<(usize, RedirectRule)> {
+        let host = Self::request_host(req)?;
+        let path = req.uri().path();
+
+        let rules = self.rules.read().expect("rules lock is poisoned");
+
+        rules
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| rule.intercept() && rule.matches(&host, path))
+            .map(|(index, rule)| (index, rule.clone()))
+    }
+
+    /// Whether the host has any rule at all (for miss-reason wording).
     fn matches_any_host(&self, host: &str) -> bool {
-        self.rules.iter().any(|rule| rule.matches_host(host))
+        self.rules
+            .read()
+            .expect("rules lock is poisoned")
+            .iter()
+            .any(|rule| rule.matches_host(host))
+    }
+
+    /// Whether the host has an interceptable rule.
+    fn has_interceptable_host(&self, host: &str) -> bool {
+        self.rules
+            .read()
+            .expect("rules lock is poisoned")
+            .iter()
+            .any(|rule| rule.intercept() && rule.matches_host(host))
+    }
+
+    /// Index of the first interceptable rule matching the host, so the
+    /// CONNECT status event names the rule that actually decided. `None`
+    /// means the host is tunneled untouched (no interceptable rule).
+    fn intercept_rule_index(&self, server_name: &str) -> Option<usize> {
+        self.rules
+            .read()
+            .expect("rules lock is poisoned")
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| rule.intercept() && rule.matches_host(server_name))
+            .map(|(index, _)| index)
     }
 }
 
@@ -155,10 +326,41 @@ impl HttpHandler for DevRedirect {
         client_hello: hudsucker::rustls::server::ClientHello<'_>,
     ) -> bool {
         let Some(server_name) = client_hello.server_name() else {
+            self.events.record_connect(
+                "",
+                Decision::Missed {
+                    reason: "no SNI in ClientHello".into(),
+                },
+            );
             return false;
         };
 
-        self.matches_any_host(server_name)
+        let rule_index = self.intercept_rule_index(server_name);
+
+        if let Some(rule_index) = rule_index {
+            self.events.record_connect(
+                server_name,
+                Decision::Matched {
+                    rule_index,
+                    target: "(TLS decrypted)".into(),
+                },
+            );
+        } else if self.matches_any_host(server_name) {
+            tracing::info!(
+                host = %server_name,
+                "TLS passthrough: rule sets intercept = false"
+            );
+            self.events.record_connect(server_name, Decision::Tunnel);
+        } else {
+            self.events.record_connect(
+                server_name,
+                Decision::Missed {
+                    reason: "host not configured".into(),
+                },
+            );
+        }
+
+        rule_index.is_some()
     }
 
     async fn handle_request(
@@ -166,45 +368,182 @@ impl HttpHandler for DevRedirect {
         _ctx: &HttpContext,
         req: Request<Body>,
     ) -> RequestOrResponse {
-        RequestOrResponse::Request(self.handle_request_inner(req))
+        self.handle_request_inner(req).await
     }
 
     async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
-        self.handle_response_inner(res)
+        self.handle_response_inner(res).await
     }
 }
 
 impl DevRedirect {
-    fn handle_request_inner(&mut self, mut req: Request<Body>) -> Request<Body> {
-        let pending_csp = self.rewrite_request(&mut req);
+    async fn handle_request_inner(&mut self, mut req: Request<Body>) -> RequestOrResponse {
+        // CONNECT arrives in authority-form (`Uri::path()` is empty), so the
+        // generic path below would emit a phantom "miss: no rule matched the
+        // path" request event for every tunnel. CONNECT decisions are
+        // reported by `should_intercept_tls` only; hudsucker tunnels the
+        // request as-is.
+        if req.method() == hudsucker::hyper::Method::CONNECT {
+            return RequestOrResponse::Request(req);
+        }
 
-        self.pending_csp = pending_csp;
+        let method = req.method().to_string();
+        let host = Self::request_host(&req).unwrap_or_default();
+        let path = req.uri().path().to_string();
 
-        req
-    }
+        // Replay from fixtures has priority over the rules: an offline smoke
+        // must not touch the network. The original prod URL is the key.
+        if let Some(response) = self.replay_response(&req) {
+            // The hit is its own outcome: report it like a matched decision
+            // with a synthetic target, and close the event out immediately —
+            // `handle_response` never sees a replayed answer.
+            let started_ms = now_ms();
+            let event_id = self.events.record_request(
+                &method,
+                &host,
+                &path,
+                Decision::Matched {
+                    rule_index: 0,
+                    target: "(replay)".into(),
+                },
+            );
+            self.events.record_response(
+                event_id,
+                response.status().as_u16(),
+                now_ms().saturating_sub(started_ms),
+            );
+            return RequestOrResponse::Response(response);
+        }
 
-    fn rewrite_request(&self, req: &mut Request<Body>) -> Option<CspOverride> {
-        let matched = self.matching_rule(req);
+        self.pending_record = self.recorder.as_ref().and_then(|_| Self::record_meta(&req));
 
+        let matched = self.matching_rule_index(&req);
+
+        // The request URI may carry tokens in its query — the info line
+        // logs the path only, the full URI is debug-level.
         tracing::info!(
             method = %req.method(),
             host = ?req.headers().get(header::HOST),
-            uri = %req.uri(),
+            path = %req.uri().path(),
             matches = matched.is_some(),
             "HTTP request"
         );
+        tracing::debug!(uri = %req.uri(), "HTTP request URI");
 
-        let rule = matched?;
+        let started_ms = now_ms();
 
-        let Some(new_uri) = rule.target_uri(req) else {
-            tracing::error!(
-                uri = ?req.uri(),
-                "failed to construct local target URI"
-            );
+        let Some((rule_index, rule)) = matched else {
+            let reason = if self.has_interceptable_host(&host) {
+                "no rule matched the path"
+            } else if self.matches_any_host(&host) {
+                "host is TLS passthrough (intercept = false)"
+            } else {
+                "host not configured"
+            };
+            // With replay active, a plain miss reads like a misconfigured
+            // rule — say that the fixtures were consulted first.
+            let reason = if self.replayer.is_some() {
+                format!("{reason}; no fixture; fell through to rules")
+            } else {
+                reason.to_string()
+            };
 
-            return None;
+            let event_id =
+                self.events
+                    .record_request(&method, &host, &path, Decision::Missed { reason });
+            self.pending = Some(Pending {
+                event_id,
+                started_ms,
+                edits: ResponseEdits::default(),
+            });
+            // Missed requests go to prod unchanged; recording covers
+            // intercepted hosts' traffic regardless, keep the meta.
+
+            return RequestOrResponse::Request(req);
         };
 
+        let event_id = self.events.record_request(
+            &method,
+            &host,
+            &path,
+            Decision::Matched {
+                rule_index,
+                target: rule.target().to_string(),
+            },
+        );
+
+        // Map Local: a `file:` target serves static files directly instead of
+        // redirecting to a dev server. The response is built here, so its
+        // response edits, outcome and HAR entry are recorded here too —
+        // `handle_response` never sees it.
+        if rule.is_file_target() {
+            let file_rule = rule.clone();
+            let file_method = req.method().clone();
+            let file_uri = req.uri().clone();
+            let (mut res, file_body) = match tokio::task::spawn_blocking(move || {
+                serve_from_file_target(&file_rule, &file_method, &file_uri)
+            })
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    tracing::error!(%err, "file target worker failed");
+                    plain_response(
+                        hudsucker::hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                        "file target error\n",
+                    )
+                }
+            };
+            let edits = ResponseEdits::from_rule(&rule);
+
+            if let Some(csp_override) = &edits.csp_override {
+                apply_csp_override(res.headers_mut(), csp_override);
+                tracing::info!(
+                    ?csp_override,
+                    "csp override applied to file-target response"
+                );
+            }
+
+            if edits.embed {
+                strip_embed_blockers(res.headers_mut());
+            }
+
+            self.events.record_response(
+                event_id,
+                res.status().as_u16(),
+                now_ms().saturating_sub(started_ms),
+            );
+
+            // File-target answers must land in the HAR too, or a replay of
+            // the session would lose every Map Local response. A HEAD answer
+            // records an empty body — the client never received one either.
+            if let Some(recorder) = self.recorder.as_ref() {
+                recorder.record(
+                    &method,
+                    &original_url(&req),
+                    headers_to_har(req.headers()),
+                    res.status().as_u16(),
+                    headers_to_har(res.headers()),
+                    &file_body,
+                    now_ms().saturating_sub(started_ms) as i64,
+                );
+            }
+
+            return RequestOrResponse::Response(res);
+        }
+
+        let edits = self.rewrite_request(&rule, &mut req);
+
+        self.pending = Some(Pending {
+            event_id,
+            started_ms,
+            edits,
+        });
+
+        RequestOrResponse::Request(req)
+    }
+
+    fn rewrite_request(&self, rule: &RedirectRule, req: &mut Request<Body>) -> ResponseEdits {
         let path_and_query = req
             .uri()
             .path_and_query()
@@ -212,17 +551,26 @@ impl DevRedirect {
             .unwrap_or("/")
             .to_string();
 
+        let Some(new_uri) = rule.target_uri(&path_and_query) else {
+            tracing::error!(
+                uri = ?req.uri(),
+                "failed to construct local target URI"
+            );
+
+            return ResponseEdits::default();
+        };
+
         *req.uri_mut() = new_uri;
 
-        let host_value = match local_target_host(&rule.local_target) {
+        let host_value = match local_target_host(rule.target()) {
             Some(host) => host,
             None => {
                 tracing::error!(
-                    target = %rule.local_target,
+                    target = %rule.target(),
                     "failed to extract local target host"
                 );
 
-                return None;
+                return ResponseEdits::default();
             }
         };
 
@@ -231,54 +579,238 @@ impl DevRedirect {
         }
 
         tracing::info!(
-            host = %rule.prod_host,
+            host = %rule.host(),
             path = %path_and_query,
-            target = %rule.local_target,
+            target = %rule.target(),
             "redirecting request to local dev server"
         );
 
-        rule.csp_override.clone()
+        ResponseEdits::from_rule(rule)
     }
 
-    fn handle_response_inner(&mut self, mut res: Response<Body>) -> Response<Body> {
-        if let Some(csp_override) = self.pending_csp.take() {
-            apply_csp_override(res.headers_mut(), &csp_override);
+    async fn handle_response_inner(&mut self, mut res: Response<Body>) -> Response<Body> {
+        if let Some(pending) = self.pending.take() {
+            if let Some(csp_override) = &pending.edits.csp_override {
+                apply_csp_override(res.headers_mut(), csp_override);
 
-            tracing::info!(?csp_override, "csp override applied to redirected response");
+                tracing::info!(?csp_override, "csp override applied to redirected response");
+            }
+
+            if pending.edits.embed {
+                strip_embed_blockers(res.headers_mut());
+            }
+
+            self.events.record_response(
+                pending.event_id,
+                res.status().as_u16(),
+                now_ms().saturating_sub(pending.started_ms),
+            );
+        }
+
+        // Recording needs the whole body, which means buffering: streaming
+        // responses (SSE, long-poll) are not suitable for recording anyway.
+        if let (Some(meta), Some(recorder)) = (self.pending_record.take(), self.recorder.clone()) {
+            return self.buffer_and_record(recorder, meta, res).await;
         }
 
         res
     }
+
+    async fn buffer_and_record(
+        &self,
+        recorder: Arc<Recorder>,
+        meta: RecordMeta,
+        res: Response<Body>,
+    ) -> Response<Body> {
+        use http_body_util::BodyExt;
+
+        let (mut parts, body) = res.into_parts();
+        let bytes = match body.collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(err) => {
+                tracing::warn!(%err, url = %meta.url, "failed to buffer response for recording");
+                // The client gets an empty body now; the stale length and
+                // encoding headers would describe bytes that never arrive.
+                strip_stale_body_headers(&mut parts.headers);
+                return Response::from_parts(parts, Body::empty());
+            }
+        };
+
+        recorder.record(
+            &meta.method,
+            &meta.url,
+            meta.headers,
+            parts.status.as_u16(),
+            headers_to_har(&parts.headers),
+            &bytes,
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+                - meta.started_ms as i64)
+                .max(0),
+        );
+
+        // `Bytes` is cheap to clone — no need to copy into a Vec.
+        Response::from_parts(parts, Body::from(bytes))
+    }
 }
 
-fn normalize_host(host: &str) -> String {
-    host.trim()
-        .trim_end_matches('.')
-        .split(':')
-        .next()
+/// Content-Type by file extension for Map Local responses. Text types carry
+/// a charset; unknown extensions are served as `application/octet-stream`.
+fn mime_type(path: &std::path::Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
         .unwrap_or("")
-        .to_ascii_lowercase()
+        .to_ascii_lowercase();
+
+    match ext.as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" | "map" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "wasm" => "application/wasm",
+        "txt" => "text/plain; charset=utf-8",
+        "xml" => "application/xml",
+        "pdf" => "application/pdf",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        _ => "application/octet-stream",
+    }
 }
 
-fn normalize_path_prefix(path: &str) -> String {
-    let mut value = if path.is_empty() {
-        "/".to_string()
-    } else {
-        path.to_string()
-    };
+/// Decode `%XX` sequences of a URL path. `None` on malformed escapes or
+/// non-UTF-8 output.
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
 
-    if !value.starts_with('/') {
-        value.insert(0, '/');
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3)?;
+            let hi = (hex[0] as char).to_digit(16)?;
+            let lo = (hex[1] as char).to_digit(16)?;
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
     }
 
-    value
+    String::from_utf8(out).ok()
 }
 
-fn local_target_host(target: &str) -> Option<String> {
-    let uri: Uri = target.parse().ok()?;
-    let authority = uri.authority()?;
+/// Static text response plus the exact bytes it carries, so the exchange can
+/// be recorded into the HAR without re-buffering the body.
+fn plain_response(status: hudsucker::hyper::StatusCode, body: &str) -> (Response<Body>, Bytes) {
+    let bytes = Bytes::from(body.to_owned());
+    let res = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CONTENT_LENGTH, body.len())
+        .body(Body::from(bytes.clone()))
+        .expect("static response with fixed parts always builds");
 
-    Some(authority.as_str().to_string())
+    (res, bytes)
+}
+
+/// Map Local: serve a request from the `file:<dir>` target's directory by the
+/// requested path — the cheap way to put local assets on top of prod without
+/// a dev server. `..` segments and symlink escapes are rejected; directories
+/// are not listed; the query string is not part of the lookup.
+///
+/// Returns the response and the exact body bytes it carries (empty for HEAD
+/// and error answers), so the caller can record the exchange into the HAR.
+fn serve_from_file_target(
+    rule: &RedirectRule,
+    method: &hudsucker::hyper::Method,
+    uri: &hudsucker::hyper::Uri,
+) -> (Response<Body>, Bytes) {
+    use hudsucker::hyper::{Method, StatusCode};
+    use std::path::PathBuf;
+
+    let dir = rule.file_dir().expect("file target checked by caller");
+    let head = *method == Method::HEAD;
+
+    if *method != Method::GET && !head {
+        return plain_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "only GET and HEAD are served\n",
+        );
+    }
+
+    let Some(url_path) = percent_decode(uri.path()) else {
+        return plain_response(StatusCode::BAD_REQUEST, "malformed path encoding\n");
+    };
+
+    let mut path = PathBuf::from(dir);
+    for segment in url_path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                tracing::warn!(path = %url_path, "rejected path traversal in file target");
+                return plain_response(StatusCode::FORBIDDEN, "path traversal rejected\n");
+            }
+            segment => path.push(segment),
+        }
+    }
+
+    let Ok(canonical_dir) = std::fs::canonicalize(dir) else {
+        tracing::error!(dir, "file target directory does not exist");
+        return plain_response(StatusCode::NOT_FOUND, "not found\n");
+    };
+
+    let Ok(canonical) = std::fs::canonicalize(&path) else {
+        return plain_response(StatusCode::NOT_FOUND, "not found\n");
+    };
+
+    if !canonical.starts_with(&canonical_dir) {
+        tracing::warn!(path = %url_path, "resolved outside the file target directory");
+        return plain_response(StatusCode::FORBIDDEN, "path traversal rejected\n");
+    }
+
+    if canonical.is_dir() {
+        return plain_response(StatusCode::NOT_FOUND, "not found\n");
+    }
+
+    let Ok(bytes) = std::fs::read(&canonical) else {
+        return plain_response(StatusCode::NOT_FOUND, "not found\n");
+    };
+
+    tracing::info!(
+        path = %url_path,
+        bytes = bytes.len(),
+        "serving file from file target"
+    );
+
+    let bytes = Bytes::from(bytes);
+    let builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime_type(&canonical))
+        .header(header::CONTENT_LENGTH, bytes.len());
+
+    let recorded = if head { Bytes::new() } else { bytes.clone() };
+    let res = if head {
+        builder.body(Body::empty())
+    } else {
+        builder.body(Body::from(bytes))
+    }
+    .expect("static response with fixed parts always builds");
+
+    (res, recorded)
 }
 
 #[cfg(test)]
@@ -355,6 +887,19 @@ mod tests {
             "/".into(),
             "http://127.0.0.1:5173".into(),
             csp_override,
+            true,
+            false,
+        )])
+    }
+
+    fn embed_handler() -> DevRedirect {
+        DevRedirect::new(vec![RedirectRule::new(
+            "example.com".into(),
+            "/".into(),
+            "http://127.0.0.1:5173".into(),
+            None,
+            true,
+            true,
         )])
     }
 
@@ -383,35 +928,43 @@ mod tests {
             "/".into(),
             "http://127.0.0.1:5173".into(),
             None,
+            true,
+            false,
         );
         let req = Request::builder()
             .uri("https://example.com/app.js")
             .body(Body::empty())
             .unwrap();
 
-        assert!(rule.matches_request(&req));
+        let host = DevRedirect::request_host(&req).unwrap();
+
+        assert!(rule.matches(&host, req.uri().path()));
     }
 
-    #[test]
-    fn response_for_redirected_request_gets_override() {
+    #[tokio::test]
+    async fn response_for_redirected_request_gets_override() {
         let mut h = handler(Some(CspOverride::Off));
 
         let req = request_to("example.com", "/app.js");
-        let _ = h.handle_request_inner(req);
+        let _ = h.handle_request_inner(req).await;
 
-        let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+        let res = h
+            .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
+            .await;
 
         assert!(!res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
     }
 
-    #[test]
-    fn response_for_passthrough_request_is_untouched() {
+    #[tokio::test]
+    async fn response_for_passthrough_request_is_untouched() {
         let mut h = handler(Some(CspOverride::Off));
 
         let req = request_to("other.com", "/app.js");
-        let _ = h.handle_request_inner(req);
+        let _ = h.handle_request_inner(req).await;
 
-        let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+        let res = h
+            .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
+            .await;
 
         assert_eq!(
             res.headers()[header::CONTENT_SECURITY_POLICY],
@@ -419,14 +972,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn response_without_override_keeps_csp() {
+    #[tokio::test]
+    async fn response_without_override_keeps_csp() {
         let mut h = handler(None);
 
         let req = request_to("example.com", "/app.js");
-        let _ = h.handle_request_inner(req);
+        let _ = h.handle_request_inner(req).await;
 
-        let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+        let res = h
+            .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
+            .await;
 
         assert_eq!(
             res.headers()[header::CONTENT_SECURITY_POLICY],
@@ -434,11 +989,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn response_without_prior_request_is_untouched() {
+    #[tokio::test]
+    async fn response_without_prior_request_is_untouched() {
         let mut h = handler(Some(CspOverride::Off));
 
-        let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+        let res = h
+            .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
+            .await;
 
         assert_eq!(
             res.headers()[header::CONTENT_SECURITY_POLICY],
@@ -446,19 +1003,268 @@ mod tests {
         );
     }
 
+    // ---- per-rule TLS passthrough (intercept = false) ----
+
+    // ---- embed: shed iframe blockers on target responses ----
+
+    #[tokio::test]
+    async fn embed_sheds_all_blockers_on_target_response() {
+        let mut h = embed_handler();
+
+        let req = request_to("example.com", "/app.js");
+        let _ = h.handle_request_inner(req).await;
+
+        let mut res = Response::new(Body::empty());
+        for (name, value) in [
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (
+                header::HeaderName::from_static("cross-origin-opener-policy"),
+                "same-origin",
+            ),
+            (
+                header::HeaderName::from_static("cross-origin-embedder-policy"),
+                "require-corp",
+            ),
+            (
+                header::HeaderName::from_static("cross-origin-resource-policy"),
+                "same-origin",
+            ),
+        ] {
+            res.headers_mut()
+                .insert(name, header::HeaderValue::from_static(value));
+        }
+        res.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'".parse().unwrap(),
+        );
+
+        let res = h.handle_response_inner(res).await;
+
+        assert!(!res.headers().contains_key(header::X_FRAME_OPTIONS));
+        assert!(!res.headers().contains_key("cross-origin-opener-policy"));
+        assert!(!res.headers().contains_key("cross-origin-embedder-policy"));
+        assert!(!res.headers().contains_key("cross-origin-resource-policy"));
+        // CSP is a separate concern: without csp_override it survives.
+        assert!(res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+    }
+
+    #[tokio::test]
+    async fn embed_false_keeps_blockers_on_target_response() {
+        let mut h = handler(None);
+
+        let req = request_to("example.com", "/app.js");
+        let _ = h.handle_request_inner(req).await;
+
+        let mut res = Response::new(Body::empty());
+        res.headers_mut().insert(
+            header::X_FRAME_OPTIONS,
+            header::HeaderValue::from_static("DENY"),
+        );
+
+        let res = h.handle_response_inner(res).await;
+
+        assert_eq!(res.headers()[header::X_FRAME_OPTIONS], "DENY");
+    }
+
+    #[tokio::test]
+    async fn embed_does_not_touch_passthrough_responses() {
+        let mut h = embed_handler();
+
+        let req = request_to("other.com", "/app.js");
+        let _ = h.handle_request_inner(req).await;
+
+        let mut res = Response::new(Body::empty());
+        res.headers_mut().insert(
+            header::X_FRAME_OPTIONS,
+            header::HeaderValue::from_static("DENY"),
+        );
+
+        let res = h.handle_response_inner(res).await;
+
+        assert_eq!(res.headers()[header::X_FRAME_OPTIONS], "DENY");
+    }
+
+    #[tokio::test]
+    async fn embed_and_csp_override_apply_together() {
+        // The typical iframe scenario: embed = true + csp_override = "off".
+        let mut h = DevRedirect::new(vec![RedirectRule::new(
+            "example.com".into(),
+            "/".into(),
+            "http://127.0.0.1:5173".into(),
+            Some(CspOverride::Off),
+            true,
+            true,
+        )]);
+
+        let req = request_to("example.com", "/app.js");
+        let _ = h.handle_request_inner(req).await;
+
+        let mut res = Response::new(Body::empty());
+        res.headers_mut().insert(
+            header::X_FRAME_OPTIONS,
+            header::HeaderValue::from_static("DENY"),
+        );
+        res.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'".parse().unwrap(),
+        );
+
+        let res = h.handle_response_inner(res).await;
+
+        assert!(!res.headers().contains_key(header::X_FRAME_OPTIONS));
+        assert!(!res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+    }
+
     #[test]
-    fn non_redirected_state_does_not_leak_into_cloned_handler() {
+    fn tls_intercepted_only_when_a_rule_asks_for_it() {
+        let h = DevRedirect::new(vec![RedirectRule::new(
+            "example.com".into(),
+            "/".into(),
+            "http://127.0.0.1:5173".into(),
+            None,
+            true,
+            false,
+        )]);
+
+        assert!(h.intercept_rule_index("example.com").is_some());
+        assert!(!h.intercept_rule_index("other.com").is_some());
+    }
+
+    #[test]
+    fn tls_passthrough_when_rule_sets_intercept_false() {
+        let h = DevRedirect::new(vec![RedirectRule::new(
+            "pinned.example.com".into(),
+            "/".into(),
+            "http://127.0.0.1:5173".into(),
+            None,
+            false,
+            false,
+        )]);
+
+        assert!(!h.intercept_rule_index("pinned.example.com").is_some());
+        // The host is still known to the PAC (routed via the proxy), it is
+        // only tunneled instead of decrypted.
+        assert!(h.matches_any_host("pinned.example.com"));
+    }
+
+    #[test]
+    fn connect_event_names_the_deciding_rule_index() {
+        let h = DevRedirect::new(vec![
+            RedirectRule::new(
+                "example.com".into(),
+                "/api/".into(),
+                "http://127.0.0.1:1111".into(),
+                None,
+                false,
+                false,
+            ),
+            RedirectRule::new(
+                "example.com".into(),
+                "/".into(),
+                "http://127.0.0.1:2222".into(),
+                None,
+                true,
+                false,
+            ),
+        ]);
+
+        // The second rule is the one that asks to intercept — the CONNECT
+        // event must name it, not a literal rule #1.
+        assert_eq!(h.intercept_rule_index("example.com"), Some(1));
+        assert_eq!(h.intercept_rule_index("other.com"), None);
+    }
+
+    #[tokio::test]
+    async fn connect_request_does_not_emit_a_request_event() {
+        let mut h = handler(Some(CspOverride::Off));
+
+        let req = Request::builder()
+            .method("CONNECT")
+            .uri("example.com:443")
+            .body(Body::empty())
+            .unwrap();
+
+        // CONNECT is authority-form and tunneled by hudsucker before any
+        // rule matching: the handler must pass it through untouched and
+        // must not record a phantom request event.
+        let RequestOrResponse::Request(returned) = h.handle_request_inner(req).await else {
+            panic!("CONNECT must be passed through, not answered");
+        };
+        assert_eq!(returned.uri().to_string(), "example.com:443");
+
+        let events = h.events_handle().snapshot();
+        assert!(
+            events.is_empty(),
+            "CONNECT must not produce request events, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_rule_never_rewrites_requests() {
+        let mut h = DevRedirect::new(vec![RedirectRule::new(
+            "pinned.example.com".into(),
+            "/".into(),
+            "http://127.0.0.1:5173".into(),
+            None,
+            false,
+            false,
+        )]);
+
+        // Plain-HTTP requests to the host reach the handler without a TLS
+        // layer; they must pass through untouched as well.
+        let RequestOrResponse::Request(req) = h
+            .handle_request_inner(request_to("pinned.example.com", "/app.js"))
+            .await
+        else {
+            panic!("passthrough rules must pass requests through untouched");
+        };
+        assert_eq!(req.uri().to_string(), "https://pinned.example.com/app.js");
+        assert_eq!(req.headers()[header::HOST], "pinned.example.com");
+    }
+
+    #[test]
+    fn one_interceptable_rule_is_enough_to_decrypt_the_host() {
+        let h = DevRedirect::new(vec![
+            RedirectRule::new(
+                "example.com".into(),
+                "/api/".into(),
+                "http://127.0.0.1:1111".into(),
+                None,
+                false,
+                false,
+            ),
+            RedirectRule::new(
+                "example.com".into(),
+                "/".into(),
+                "http://127.0.0.1:2222".into(),
+                None,
+                true,
+                false,
+            ),
+        ]);
+
+        assert!(h.intercept_rule_index("example.com").is_some());
+    }
+
+    #[tokio::test]
+    async fn non_redirected_state_does_not_leak_into_cloned_handler() {
         // Real hudsucker flow: one handler instance processes the CONNECT
         // request (no redirect), then `serve_stream` clones that instance for
         // every decrypted inner request. The clone must not inherit the
         // non-redirected outcome: its own request decides.
         let mut connect_handler = handler(Some(CspOverride::Off));
-        let _ = connect_handler.handle_request_inner(request_to("other.com", "/"));
+        let _ = connect_handler
+            .handle_request_inner(request_to("other.com", "/"))
+            .await;
 
         let mut inner = connect_handler.clone();
-        let _ = inner.handle_request_inner(request_to("example.com", "/"));
+        let _ = inner
+            .handle_request_inner(request_to("example.com", "/"))
+            .await;
 
-        let res = inner.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+        let res = inner
+            .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
+            .await;
 
         assert!(!res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
     }
@@ -470,68 +1276,323 @@ mod tests {
                 "/app/".into(),
                 "http://127.0.0.1:1111".into(),
                 Some(CspOverride::Policy("policy-a".into())),
+                true,
+                false,
             ),
             RedirectRule::new(
                 "example.com".into(),
                 "/".into(),
                 "http://127.0.0.1:2222".into(),
                 Some(CspOverride::Policy("policy-b".into())),
+                true,
+                false,
             ),
             RedirectRule::new(
                 "other.com".into(),
                 "/".into(),
                 "http://127.0.0.1:3333".into(),
                 Some(CspOverride::Off),
+                true,
+                false,
             ),
         ])
     }
 
-    #[test]
-    fn first_matching_rule_wins() {
+    #[tokio::test]
+    async fn first_matching_rule_wins() {
         let mut h = multi_rule_handler();
 
-        let req = h.handle_request_inner(request_to("example.com", "/app/main.js"));
+        let RequestOrResponse::Request(req) = h
+            .handle_request_inner(request_to("example.com", "/app/main.js"))
+            .await
+        else {
+            panic!("redirect rules must pass the request through");
+        };
         assert_eq!(req.uri().to_string(), "http://127.0.0.1:1111/app/main.js");
 
-        let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+        let res = h
+            .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
+            .await;
 
         assert_eq!(res.headers()[header::CONTENT_SECURITY_POLICY], "policy-a");
     }
 
-    #[test]
-    fn redirect_uses_matched_rule_target() {
+    #[tokio::test]
+    async fn redirect_uses_matched_rule_target() {
         let mut h = multi_rule_handler();
 
-        let req = h.handle_request_inner(request_to("example.com", "/other.js"));
+        let RequestOrResponse::Request(req) = h
+            .handle_request_inner(request_to("example.com", "/other.js"))
+            .await
+        else {
+            panic!("redirect rules must pass the request through");
+        };
         assert_eq!(req.uri().to_string(), "http://127.0.0.1:2222/other.js");
     }
 
-    #[test]
-    fn per_rule_csp_isolated() {
+    #[tokio::test]
+    async fn per_rule_csp_isolated() {
         let mut h = DevRedirect::new(vec![
             RedirectRule::new(
                 "plain.com".into(),
                 "/".into(),
                 "http://127.0.0.1:1111".into(),
                 None,
+                true,
+                false,
             ),
             RedirectRule::new(
                 "stripped.com".into(),
                 "/".into(),
                 "http://127.0.0.1:2222".into(),
                 Some(CspOverride::Off),
+                true,
+                false,
             ),
         ]);
 
         let req = request_to("plain.com", "/");
-        let _ = h.handle_request_inner(req);
+        let _ = h.handle_request_inner(req).await;
 
-        let res = h.handle_response_inner(response_with_csp("frame-ancestors 'self'"));
+        let res = h
+            .handle_response_inner(response_with_csp("frame-ancestors 'self'"))
+            .await;
 
         assert_eq!(
             res.headers()[header::CONTENT_SECURITY_POLICY],
             "frame-ancestors 'self'"
         );
+    }
+
+    // ---- Map Local (file: targets) ----
+
+    fn file_rule(dir: &std::path::Path) -> RedirectRule {
+        RedirectRule::new(
+            "assets.example.com".into(),
+            "/".into(),
+            format!("file:{}", dir.display()),
+            None,
+            true,
+            false,
+        )
+    }
+
+    fn file_handler(dir: &std::path::Path) -> DevRedirect {
+        DevRedirect::new(vec![file_rule(dir)])
+    }
+
+    fn file_request(path: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(format!("https://assets.example.com{path}"))
+            .header(header::HOST, "assets.example.com")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn as_response(outcome: RequestOrResponse) -> Response<Body> {
+        let RequestOrResponse::Response(res) = outcome else {
+            panic!("file targets must answer with a response, not a rewritten request");
+        };
+        res
+    }
+
+    #[tokio::test]
+    async fn file_target_serves_bytes_with_mime_type() {
+        let dir = std::env::temp_dir().join(format!("rexy-maplocal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("app.js"), b"console.log(1)").unwrap();
+        std::fs::write(dir.join("page.html"), b"<html></html>").unwrap();
+
+        let mut h = file_handler(&dir);
+
+        let res = as_response(h.handle_request_inner(file_request("/app.js?v=3")).await);
+        assert_eq!(res.status(), 200);
+        assert_eq!(
+            res.headers()[header::CONTENT_TYPE],
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(res.headers()[header::CONTENT_LENGTH], "14");
+
+        let res = as_response(h.handle_request_inner(file_request("/page.html")).await);
+        assert_eq!(
+            res.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn file_target_missing_file_is_404() {
+        let dir = std::env::temp_dir().join(format!("rexy-maplocal-404-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut h = file_handler(&dir);
+
+        let res = as_response(h.handle_request_inner(file_request("/nope.js")).await);
+        assert_eq!(res.status(), 404);
+
+        // Directories are not listed, including the root.
+        let res = as_response(h.handle_request_inner(file_request("/")).await);
+        assert_eq!(res.status(), 404);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn file_target_keeps_rule_prefix_in_disk_path() {
+        let dir = temp_dir("file-prefix");
+        std::fs::create_dir_all(dir.join("static")).unwrap();
+        std::fs::write(dir.join("static/app.js"), b"prefix retained").unwrap();
+        let mut h = DevRedirect::new(vec![RedirectRule::new(
+            "assets.example.com".into(),
+            "/static/".into(),
+            format!("file:{}", dir.display()),
+            None,
+            true,
+            false,
+        )]);
+        let res = as_response(h.handle_request_inner(file_request("/static/app.js")).await);
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()[header::CONTENT_LENGTH], "15");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn file_target_rejects_traversal() {
+        let dir = std::env::temp_dir().join(format!("rexy-maplocal-trav-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ok.txt"), b"ok").unwrap();
+
+        let mut h = file_handler(&dir);
+
+        // Literal .. and percent-encoded .. both must be rejected.
+        for path in [
+            "/../secret.txt",
+            "/a/../../secret.txt",
+            "/%2e%2e/secret.txt",
+        ] {
+            let res = as_response(h.handle_request_inner(file_request(path)).await);
+            assert_eq!(res.status(), 403, "path {path} must be rejected");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_target_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("file-symlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ok.txt"), b"ok").unwrap();
+
+        // A file outside the target directory, reachable through a symlink
+        // inside it: canonicalize() resolves the link, and the resolved path
+        // must fail the starts_with check.
+        let outside = temp_dir("file-symlink-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+        symlink(outside.join("secret.txt"), dir.join("escape.txt")).unwrap();
+
+        let mut h = file_handler(&dir);
+
+        let res = as_response(h.handle_request_inner(file_request("/escape.txt")).await);
+        assert_eq!(res.status(), 403);
+
+        // A symlink staying inside the directory still serves.
+        std::fs::write(dir.join("real.txt"), b"real").unwrap();
+        symlink(dir.join("real.txt"), dir.join("alias.txt")).unwrap();
+        let res = as_response(h.handle_request_inner(file_request("/alias.txt")).await);
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()[header::CONTENT_LENGTH], "4");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[tokio::test]
+    async fn file_target_decodes_percent_escapes() {
+        let dir = std::env::temp_dir().join(format!("rexy-maplocal-esc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("my file.txt"), b"hello").unwrap();
+
+        let mut h = file_handler(&dir);
+
+        let res = as_response(h.handle_request_inner(file_request("/my%20file.txt")).await);
+        assert_eq!(res.status(), 200);
+        assert_eq!(
+            res.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn file_target_head_returns_headers_without_body() {
+        let dir = std::env::temp_dir().join(format!("rexy-maplocal-head-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("app.js"), b"console.log(1)").unwrap();
+
+        let mut h = file_handler(&dir);
+
+        let req = Request::builder()
+            .method("HEAD")
+            .uri("https://assets.example.com/app.js")
+            .header(header::HOST, "assets.example.com")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = as_response(h.handle_request_inner(req).await);
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()[header::CONTENT_LENGTH], "14");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn file_target_post_is_method_not_allowed() {
+        let dir = std::env::temp_dir().join(format!("rexy-maplocal-post-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut h = file_handler(&dir);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://assets.example.com/app.js")
+            .header(header::HOST, "assets.example.com")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = as_response(h.handle_request_inner(req).await);
+        assert_eq!(res.status(), 405);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn file_target_applies_csp_override() {
+        let dir = std::env::temp_dir().join(format!("rexy-maplocal-csp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("app.js"), b"console.log(1)").unwrap();
+
+        let mut h = DevRedirect::new(vec![RedirectRule::new(
+            "assets.example.com".into(),
+            "/".into(),
+            format!("file:{}", dir.display()),
+            Some(CspOverride::Off),
+            true,
+            false,
+        )]);
+
+        let res = as_response(h.handle_request_inner(file_request("/app.js")).await);
+        assert_eq!(res.status(), 200);
+        assert!(!res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -541,5 +1602,347 @@ mod tests {
         assert!(h.matches_any_host("example.com"));
         assert!(h.matches_any_host("other.com"));
         assert!(!h.matches_any_host("third.com"));
+    }
+
+    // ---- record/replay ----
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rexy-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    #[tokio::test]
+    async fn recorded_exchange_keeps_request_method_and_body() {
+        use http_body_util::BodyExt;
+
+        let record_dir = temp_dir("rec-method");
+        let recorder = std::sync::Arc::new(Recorder::start(&record_dir).unwrap());
+        let mut h = DevRedirect::with_fixtures(
+            vec![RedirectRule::new(
+                "example.com".into(),
+                "/".into(),
+                "http://127.0.0.1:5173".into(),
+                None,
+                true,
+                false,
+            )],
+            Some(std::sync::Arc::clone(&recorder)),
+            None,
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://example.com/api/submit")
+            .header(header::HOST, "example.com")
+            .body(Body::empty())
+            .unwrap();
+        let _ = h.handle_request_inner(req).await;
+
+        let res = h
+            .handle_response_inner(
+                Response::builder()
+                    .status(201)
+                    .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                    .header(header::CONTENT_LENGTH, "7")
+                    .body(Body::from("created"))
+                    .unwrap(),
+            )
+            .await;
+
+        // The client still receives the full body through the recording path.
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"created");
+
+        recorder.flush().unwrap();
+
+        let replayer = Replayer::open(&record_dir.join("rexy-session.har")).unwrap();
+        let recorded = replayer
+            .lookup("POST", "https://example.com/api/submit")
+            .unwrap();
+        assert_eq!(recorded.content.mime_type, "text/plain; charset=utf-8");
+        assert!(
+            replayer
+                .lookup("POST", "https://example.com/api/submit")
+                .is_some(),
+            "recorded POST must replay under POST"
+        );
+        assert!(
+            replayer
+                .lookup("GET", "https://example.com/api/submit")
+                .is_none(),
+            "method must not be dropped from the HAR"
+        );
+
+        let mut replay_handler =
+            DevRedirect::with_fixtures(vec![], None, Some(std::sync::Arc::new(replayer)));
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://example.com/api/submit")
+            .header(header::HOST, "example.com")
+            .body(Body::empty())
+            .unwrap();
+        let response = as_response(replay_handler.handle_request_inner(request).await);
+        assert_eq!(response.status(), 201);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "7");
+        assert_eq!(
+            &response.into_body().collect().await.unwrap().to_bytes()[..],
+            b"created"
+        );
+
+        std::fs::remove_dir_all(&record_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn buffering_failure_strips_body_describing_headers() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        // A body whose single frame is an error: emulates an upstream that
+        // dies mid-response while recording is active.
+        struct FailingBody;
+
+        impl hudsucker::hyper::body::Body for FailingBody {
+            type Data = hudsucker::hyper::body::Bytes;
+            type Error = hudsucker::Error;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<hudsucker::hyper::body::Frame<Self::Data>, Self::Error>>>
+            {
+                Poll::Ready(Some(Err(hudsucker::Error::Unknown)))
+            }
+        }
+
+        let record_dir = temp_dir("rec-fail");
+        let mut h = DevRedirect::with_fixtures(
+            vec![RedirectRule::new(
+                "example.com".into(),
+                "/".into(),
+                "http://127.0.0.1:5173".into(),
+                None,
+                true,
+                false,
+            )],
+            Some(std::sync::Arc::new(Recorder::start(&record_dir).unwrap())),
+            None,
+        );
+
+        let _ = h
+            .handle_request_inner(request_to("example.com", "/stream"))
+            .await;
+
+        let res = Response::builder()
+            .status(200)
+            .header(header::CONTENT_LENGTH, "42")
+            .header(header::CONTENT_ENCODING, "gzip")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(hudsucker::Body::from(
+                http_body_util::combinators::BoxBody::new(FailingBody),
+            ))
+            .unwrap();
+
+        let res = h.handle_response_inner(res).await;
+
+        // The client gets an empty body: no stale length/encoding headers.
+        assert!(!res.headers().contains_key(header::CONTENT_LENGTH));
+        assert!(!res.headers().contains_key(header::CONTENT_ENCODING));
+        assert!(!res.headers().contains_key(header::TRANSFER_ENCODING));
+        // Unrelated headers survive.
+        assert_eq!(res.headers()[header::CONTENT_TYPE], "text/plain");
+
+        std::fs::remove_dir_all(&record_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn file_target_exchange_is_recorded_into_har() {
+        let dir = temp_dir("rec-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("app.js"), b"console.log(1)").unwrap();
+
+        let record_dir = temp_dir("rec-file-har");
+        let recorder = std::sync::Arc::new(Recorder::start(&record_dir).unwrap());
+        let mut h = DevRedirect::with_fixtures(
+            vec![file_rule(&dir)],
+            Some(std::sync::Arc::clone(&recorder)),
+            None,
+        );
+
+        let res = as_response(h.handle_request_inner(file_request("/app.js")).await);
+        assert_eq!(res.status(), 200);
+
+        let head_req = Request::builder()
+            .method("HEAD")
+            .uri("https://assets.example.com/app.js")
+            .header(header::HOST, "assets.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let res = as_response(h.handle_request_inner(head_req).await);
+        assert_eq!(res.status(), 200);
+
+        recorder.flush().unwrap();
+
+        let replayer = Replayer::open(&record_dir.join("rexy-session.har")).unwrap();
+        // GET and HEAD are separate entries: the GET one carries the file
+        // bytes, HEAD records an empty body.
+        let get = replayer
+            .lookup("GET", "https://assets.example.com/app.js")
+            .expect("file-target GET must be recorded");
+        assert_eq!(get.status, 200);
+        assert_eq!(get.content.size, 14);
+
+        let head = replayer
+            .lookup("HEAD", "https://assets.example.com/app.js")
+            .expect("file-target HEAD must be recorded");
+        assert_eq!(head.content.size, 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&record_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn replay_of_entry_without_content_text_returns_empty_body() {
+        use http_body_util::BodyExt;
+
+        let dir = temp_dir("replay-notext");
+        std::fs::create_dir_all(&dir).unwrap();
+        let har_path = dir.join("session.har");
+        // Chrome DevTools export of a 304: the response content carries no
+        // `text` field.
+        let raw = r#"{"log":{"version":"1.2","creator":{"name":"x","version":"1"},"entries":[{"startedDateTime":"2026-01-01T00:00:00.000Z","time":0,"request":{"method":"GET","url":"https://a.example.com/x","httpVersion":"HTTP/1.1","headers":[],"queryString":[],"cookies":[],"headersSize":-1,"bodySize":-1},"response":{"status":304,"statusText":"Not Modified","httpVersion":"HTTP/1.1","headers":[],"content":{"size":0,"mimeType":"text/html"},"headersSize":-1,"bodySize":0}}]}}"#;
+        std::fs::write(&har_path, raw).unwrap();
+
+        let replayer = Replayer::open(&har_path).unwrap();
+        let mut h = DevRedirect::with_fixtures(vec![], None, Some(std::sync::Arc::new(replayer)));
+
+        let outcome = h
+            .handle_request_inner(request_to("a.example.com", "/x"))
+            .await;
+        let res = match outcome {
+            RequestOrResponse::Response(res) => res,
+            RequestOrResponse::Request(_) => panic!("replay must answer with a response"),
+        };
+
+        assert_eq!(res.status(), 304);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert!(bytes.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn replay_hit_is_visible_in_the_status_feed() {
+        let dir = temp_dir("replay-hit");
+        std::fs::create_dir_all(&dir).unwrap();
+        let har_path = dir.join("session.har");
+        let raw = r#"{"log":{"version":"1.2","creator":{"name":"x","version":"1"},"entries":[{"startedDateTime":"2026-01-01T00:00:00.000Z","time":0,"request":{"method":"GET","url":"https://a.example.com/x","httpVersion":"HTTP/1.1","headers":[],"queryString":[],"cookies":[],"headersSize":-1,"bodySize":-1},"response":{"status":200,"statusText":"","httpVersion":"HTTP/1.1","headers":[],"content":{"size":2,"mimeType":"text/plain","text":"aGk=","encoding":"base64"},"headersSize":-1,"bodySize":2}}]}}"#;
+        std::fs::write(&har_path, raw).unwrap();
+
+        let replayer = Replayer::open(&har_path).unwrap();
+        let mut h = DevRedirect::with_fixtures(vec![], None, Some(std::sync::Arc::new(replayer)));
+
+        let outcome = h
+            .handle_request_inner(request_to("a.example.com", "/x"))
+            .await;
+        assert!(matches!(outcome, RequestOrResponse::Response(_)));
+
+        let events = h.events_handle().snapshot();
+        assert_eq!(events.len(), 1, "replay hit must emit one event");
+        assert_eq!(events[0].kind, "request");
+        assert_eq!(events[0].method, "GET");
+        assert_eq!(
+            events[0].status,
+            Some(200),
+            "hit closes with the fixture status"
+        );
+        assert!(matches!(
+            &events[0].decision,
+            Some(Decision::Matched { rule_index: 0, target })
+                if target == "(replay)"
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn replay_miss_reason_mentions_fixtures() {
+        let dir = temp_dir("replay-miss");
+        std::fs::create_dir_all(&dir).unwrap();
+        let har_path = dir.join("session.har");
+        // One entry for a URL the request below will not use.
+        let raw = r#"{"log":{"version":"1.2","creator":{"name":"x","version":"1"},"entries":[{"startedDateTime":"2026-01-01T00:00:00.000Z","time":0,"request":{"method":"GET","url":"https://a.example.com/other","httpVersion":"HTTP/1.1","headers":[],"queryString":[],"cookies":[],"headersSize":-1,"bodySize":-1},"response":{"status":200,"statusText":"","httpVersion":"HTTP/1.1","headers":[],"content":{"size":0,"mimeType":"text/plain"},"headersSize":-1,"bodySize":0}}]}}"#;
+        std::fs::write(&har_path, raw).unwrap();
+
+        let replayer = Replayer::open(&har_path).unwrap();
+        // No rules at all: the request misses both the fixtures and the rules.
+        let mut h = DevRedirect::with_fixtures(vec![], None, Some(std::sync::Arc::new(replayer)));
+
+        let outcome = h
+            .handle_request_inner(request_to("a.example.com", "/x"))
+            .await;
+        assert!(matches!(outcome, RequestOrResponse::Request(_)));
+
+        let events = h.events_handle().snapshot();
+        assert_eq!(events.len(), 1);
+        let Some(Decision::Missed { reason }) = &events[0].decision else {
+            panic!("expected a missed decision, got {:?}", events[0].decision);
+        };
+        assert!(reason.contains("no fixture"), "{reason}");
+        assert!(reason.contains("host not configured"), "{reason}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn replay_has_priority_over_rules_and_misses_fall_through() {
+        let dir = temp_dir("replay-priority");
+        std::fs::create_dir_all(&dir).unwrap();
+        let har_path = dir.join("session.har");
+        // Fixture for one URL on a host that also has a rewrite rule.
+        let raw = r#"{"log":{"version":"1.2","creator":{"name":"x","version":"1"},"entries":[{"startedDateTime":"2026-01-01T00:00:00.000Z","time":0,"request":{"method":"GET","url":"https://a.example.com/fixed","httpVersion":"HTTP/1.1","headers":[],"queryString":[],"cookies":[],"headersSize":-1,"bodySize":-1},"response":{"status":200,"statusText":"","httpVersion":"HTTP/1.1","headers":[],"content":{"size":7,"mimeType":"text/plain","text":"Zml4dHVyZQ==","encoding":"base64"},"headersSize":-1,"bodySize":7}}]}}"#;
+        std::fs::write(&har_path, raw).unwrap();
+
+        let replayer = Replayer::open(&har_path).unwrap();
+        let mut h = DevRedirect::with_fixtures(
+            vec![RedirectRule::new(
+                "a.example.com".into(),
+                "/".into(),
+                "http://127.0.0.1:9999".into(),
+                None,
+                true,
+                false,
+            )],
+            None,
+            Some(std::sync::Arc::new(replayer)),
+        );
+
+        // The fixture wins over the rule: the answer never reaches the
+        // target and is not a rewritten request.
+        let outcome = h
+            .handle_request_inner(request_to("a.example.com", "/fixed"))
+            .await;
+        let res = match outcome {
+            RequestOrResponse::Response(res) => res,
+            RequestOrResponse::Request(_) => {
+                panic!("a fixture hit must answer with a response, not a rewrite")
+            }
+        };
+        assert_eq!(res.status(), 200);
+
+        // No fixture for this URL: the usual rules apply.
+        let outcome = h
+            .handle_request_inner(request_to("a.example.com", "/unmatched"))
+            .await;
+        let RequestOrResponse::Request(req) = outcome else {
+            panic!("a replay miss must fall through to the rules");
+        };
+        assert_eq!(req.uri().to_string(), "http://127.0.0.1:9999/unmatched");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

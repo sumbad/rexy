@@ -14,13 +14,17 @@ npm-package = "rexy-cli"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-hudsucker = "0.25"
+hudsucker = { version = "0.25", features = ["http2"] }
 hyper-rustls = { version = "0.27", default-features = false, features = [
   "http1",
+  "http2",
   "rustls-native-certs",
 ] }
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+base64 = "0.22"
+http-body-util = "0.1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "1.1"
 tokio = { version = "1", features = [
   "macros",
