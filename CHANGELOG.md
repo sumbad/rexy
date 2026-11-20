@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- Release builds for Apple Silicon use the supported macOS 15 runner.
+
 ## [0.3.0] - 2026-11-20
 
 ### Added
